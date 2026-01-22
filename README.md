@@ -158,5 +158,3 @@ $folders.data | ConvertTo-Json -Depth 10
     "type": "container"
   }
 ]
-
-```
