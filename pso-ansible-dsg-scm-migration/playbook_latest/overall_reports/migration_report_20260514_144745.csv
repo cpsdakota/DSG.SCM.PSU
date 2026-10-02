@@ -1,2 +1,0 @@
-Device,IP Address,Serial,Original Hostname,New Hostname,Backup,Pre-Snapshot,Remove Panorama,Cloud Service,Hostname Change,Claim to SCM,Post-Snapshot
-Store1860fw1,10.18.60.186,021201055233,SCMMANAGED-Store1860fw1,SCMMANAGED-SCMMANAGED-Store1860fw1,SUCCESS,SUCCESS,SUCCESS,SUCCESS,FAILED,SUCCESS,SUCCESS

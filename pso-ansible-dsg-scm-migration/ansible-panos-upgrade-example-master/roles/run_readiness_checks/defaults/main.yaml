@@ -1,6 +1,0 @@
----
-checks:
-  - '!ha'
-  - '!session_exist'
-  - '!arp_entry_exist'
-  - '!ip_sec_tunnel_status'

@@ -1,9 +1,0 @@
----
-snapshot_directory: "./snapshots"
-snapshot_filename: "snapshot_{{ ansible_date_time.epoch }}_{{ connection_id }}"
-snapshot_output_file: "{{ [ snapshot_directory, snapshot_filename] | path_join }}.json"
-state_areas:
-  - 'arp_table'
-  - 'routes'
-  - 'session_stats'
-  - 'nics'
