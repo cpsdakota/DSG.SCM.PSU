@@ -1,0 +1,56 @@
+---
+- hosts: all
+  connection: local
+  gather_facts: true
+  name: Example snapshot comparison playbook
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  roles:
+
+    ################################
+    # Setup vars for other roles   #
+    ################################
+
+    - role: set_provider
+      name: Set the provider for connections
+
+    ##################
+    # Check Device   #
+    ##################
+
+    - role: run_readiness_checks
+      name: READINESS - Check the device can be upgraded
+
+    ##################
+    # TAKE SNAPSHOTS #
+    ##################
+
+    - role: take_snapshot
+      name: SNAPSHOTS - Take the pre-upgrade snapshot
+      vars:
+        snapshot_filename: "pre_upgrade_snapshot_{{ connection_id }}"
+
+    ############
+    # UPGRADE  #
+    ############
+
+    - role: upgrade
+      name: UPGRADES - Upgrade the Device
+
+    ############################
+    # Check State post-upgrade #
+    ############################
+
+    - role: take_snapshot
+      name: SNAPSHOTS - Take the post-upgrade snapshot
+      vars:
+        snapshot_filename: "post_upgrade_snapshot_{{ connection_id }}"
+
+    - role: snapshot_report_from_files
+      name: REPORTS - Compare the two snapshot reports from the main
+      vars:
+        left_snapshot: "pre_upgrade_snapshot_{{ connection_id }}"
+        right_snapshot: "post_upgrade_snapshot_{{ connection_id }}"
+        report_output_file: "{{ connection_id }}_report.json"

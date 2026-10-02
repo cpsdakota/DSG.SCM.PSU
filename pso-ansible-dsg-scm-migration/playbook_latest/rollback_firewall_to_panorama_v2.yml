@@ -1,0 +1,129 @@
+---
+# =============================================================================
+# Rollback Firewall from SCM back to Panorama Management — master orchestrator.
+#
+# Runs the four rollback playbooks in dependency order. Reverses the SCM
+# migration performed by scm_migration_final_v2.yml.
+#
+# Stages (NEW ORDER as of v2):
+#
+#   1. Import saved device state to firewall    (import_device_state_firewall.yml)
+#        - Restores the full pre-migration configuration from
+#          device_state/device-state-<host>.tgz directly to the firewall.
+#        - Triggers a REBOOT; playbook waits for the device to come back.
+#        - This single step undoes virtually all migration config changes:
+#            * Advanced Routing reverts to disabled (legacy Virtual Routers
+#              come back, along with their interface assignments)
+#            * <cloud-service/> element is removed
+#            * <panorama-server> is restored to the on-prem Panorama IP
+#            * Template/shared-policy push settings come back as they were
+#
+#        IMPORTANT: the .tgz MUST be a pre-migration snapshot. STEP 6B of
+#        scm_migration_final_v2.yml captures state AFTER the config changes,
+#        so its output is NOT suitable for rollback. Run save_device_state.yml
+#        manually BEFORE the migration to capture a clean baseline, OR move
+#        STEP 6B in the migration playbook to before STEP 4.
+#
+#   2. Disable Advanced Routing Engine          (disable_advanced_routing.yml)
+#        - After the state restore, Advanced Routing is typically already
+#          disabled — this stage detects that and ends_host early ("already
+#          disabled, no action needed"). It only triggers a fresh
+#          disable+reboot if the restore didn't include the routing flip.
+#
+#   3. Re-enable on-prem Panorama management    (reenable_panorama_management.yml)
+#        - Stage 1 (import-state) already removed <cloud-service/>, set
+#          <panorama-server>, and reverted advanced routing. So this stage
+#          SKIPS its config steps by default (reenable_apply_config=false) and
+#          only runs the CLI-only operational commands that the device-state
+#          file does NOT capture:
+#              set system setting template enable
+#              set system setting shared-policy enable
+#          These re-enable template + policy/objects push from Panorama.
+#        - If you ever run without a clean device-state (or standalone), force
+#          the config steps back on with -e reenable_apply_config=true.
+#
+#   4. Unclaim device(s) from SCM               (unclaim_devices_from_scm.yml)
+#        - Disables Configuration Scope (Cloud-Managed → Monitoring-only),
+#          then releases the device registration (Monitoring → Available)
+#          via the SCM /device-registrations/release endpoint. Marked
+#          OPTIONAL — Stage 4 is not required for the firewall to function
+#          under Panorama again; it just cleans up the SCM-side record.
+#
+# Why this order:
+#   The previous order (disable_routing → reenable_panorama → unclaim →
+#   import_state) failed at Stage 1 with "DHCP Interface ae1.XXXX has no
+#   virtual-router configured" because the SCM-shaped current config has
+#   Logical Routers (Advanced Routing) instead of legacy Virtual Routers.
+#   Disabling Advanced Routing leaves orphaned interfaces → commit invalid.
+#   Restoring the pre-migration state FIRST brings back the legacy VR
+#   definitions, so the subsequent stages either no-op (state already
+#   correct) or only apply the runtime-only settings the .tgz can't carry.
+#
+# Prerequisites:
+#   - A PRE-MIGRATION device-state .tgz at device_state/device-state-<host>.tgz
+#   - SCM credentials in group_vars/all/scm_credentials.yml
+#   - Firewall credentials in group_vars/firewalls/credentials.yml (vaulted)
+#     OR passed via -e
+#   - Stage 4 auto-detects scm_sase_base_url; pass -e to pin a shard
+#
+# Usage:
+#   Full rollback for a single firewall:
+#     ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01,localhost
+#
+#   Pin SCM shard explicitly (skip Stage 4 auto-detection):
+#     ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01,localhost \
+#       -e 'scm_sase_base_url=https://paas-17.prod.panorama.paloaltonetworks.com'
+#
+#   Skip the SCM unclaim stage (leave the device in SCM):
+#     ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01,localhost \
+#       --skip-tags unclaim
+#
+#   Run only a specific stage by tag:
+#     --tags import_state              (Stage 1 only)
+#     --tags disable_routing           (Stage 2 only)
+#     --tags reenable_panorama         (Stage 3 only)
+#     --tags unclaim                   (Stage 4 only)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Import saved device state back onto the firewall (REBOOT).
+# Restores pre-migration config + reboots + waits for device to come back.
+# ---------------------------------------------------------------------------
+- import_playbook: import_device_state_firewall.yml
+  tags:
+    - rollback
+    - import_state
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Disable Advanced Routing Engine (typically no-op after restore).
+# Idempotent: skips if state restore already disabled it.
+# ---------------------------------------------------------------------------
+- import_playbook: disable_advanced_routing.yml
+  tags:
+    - rollback
+    - disable_routing
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Re-enable on-prem Panorama management.
+# Idempotent on config side; required for the CLI-only runtime settings
+# (set system setting template/shared-policy enable) that the .tgz doesn't
+# capture.
+# ---------------------------------------------------------------------------
+- import_playbook: reenable_panorama_management.yml
+  tags:
+    - rollback
+    - reenable_panorama
+
+# ---------------------------------------------------------------------------
+# Stage 4 — Unclaim device(s) from SCM (OPTIONAL — use --skip-tags unclaim)
+# ---------------------------------------------------------------------------
+- import_playbook: unclaim_devices_from_scm.yml
+  tags:
+    - rollback
+    - unclaim

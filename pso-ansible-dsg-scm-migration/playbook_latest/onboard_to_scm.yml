@@ -1,0 +1,333 @@
+---
+# =============================================================================
+# SCM Onboarding Orchestration Playbook
+# =============================================================================
+#
+# Runs the full 11-step sequence to configure NGFWs and onboard them to SCM.
+#
+# Usage (all firewalls in inventory):
+#   ansible-playbook playbooks/onboard_to_scm.yml \
+#     --vault-password-file .vault_pass \
+#     -e 'vm_series_devices=["007957000846320","007957000846322"]' \
+#     -e 'config_file=dummy-config.xml'
+#
+# Usage (specific firewall):
+#   ansible-playbook playbooks/onboard_to_scm.yml \
+#     --vault-password-file .vault_pass \
+#     -e '{"firewall_list":["dicks-vmseries-lab22-firewall02"]}' \
+#     -e 'vm_series_devices=["007957000846320"]' \
+#     -e 'config_file=dummy-config.xml'
+#
+# Required variables:
+#   vm_series_devices  — serial number(s) to claim in SCM (string or JSON list)
+#   config_file        — path to XML file for partial config upload (relative to project root)
+#
+# Optional variables:
+#   firewall_list      — restrict execution to specific firewall hostnames
+#   target_folder      — SCM folder to move devices into  (default: dick_prod)
+#   dns_primary        — primary DNS server               (default: 8.8.8.8)
+#   dns_secondary      — secondary DNS server             (default: 8.8.4.4)
+#   ntp_primary        — primary NTP server               (default: pool.ntp.org)
+#   ntp_secondary      — secondary NTP server             (default: time.google.com)
+# =============================================================================
+
+
+# ==========================================
+# STEP 1 — Firewall Backups
+# Exports running config (YAML + XML) and 50+ operational show commands.
+# ==========================================
+- name: "STEP 1 — Firewall Backups"
+  import_playbook: firewalls_backups.yml
+
+
+# ==========================================
+# STEP 2 — Pre-change Network Snapshot
+# Captures ARP table, interface status, and static routes as baseline.
+# ==========================================
+- name: "STEP 2 — Pre-change Network Snapshot"
+  import_playbook: pre_snapshot_network.yml
+
+
+# ==========================================
+# STEP 3 — Remove Panorama Management
+# Strips all Panorama server references, log collector config,
+# and template tracking metadata. Auto-commits changes.
+# ==========================================
+- name: "STEP 3 — Remove Panorama Management"
+  import_playbook: remove_panorama_management.yml
+
+
+# ==========================================
+# STEP 4 — Network Snapshot After Panorama Removal
+# Second snapshot taken after Panorama references are gone.
+# Overwrites the Step 2 pre-snapshot with the clean post-removal state.
+# ==========================================
+- name: "STEP 4 — Network Snapshot After Panorama Removal"
+  import_playbook: pre_snapshot_network.yml
+
+
+# ==========================================
+# STEP 5 — Set Panorama Cloud Service
+# Sets the <cloud-service/> element so the firewall can reach SCM.
+# Auto-commits changes.
+# ==========================================
+- name: "STEP 5 — Set Panorama Cloud Service"
+  import_playbook: set_panorama_cloud_service.yml
+
+
+# ==========================================
+# STEP 6 — Upload Partial Config (optional)
+# Merges the specified XML config file into the firewall candidate config.
+# Skipped automatically if config_file is not provided via -e.
+# ==========================================
+- name: "STEP 6 — Upload Partial Config"
+  import_playbook: upload_partial_config.yml
+  when: config_file is defined
+
+
+# ==========================================
+# STEP 7 — Configure DNS and NTP
+# Sets primary/secondary DNS and NTP servers on each firewall.
+# Auto-commits changes.
+# ==========================================
+- name: "STEP 7 — Configure DNS and NTP"
+  import_playbook: configure_dns_ntp.yml
+
+
+# ==========================================
+# STEP 8 — Enable Advanced Routing Engine
+# Enables ARE, commits, and reboots each firewall.
+# Waits up to 12 minutes per device for it to come back online.
+# Skips if ARE is already enabled (idempotent).
+# ==========================================
+- name: "STEP 8 — Enable Advanced Routing Engine"
+  import_playbook: enable_advanced_routing.yml
+
+
+# ==========================================
+# STEP 9a — Claim Devices to SCM
+# Submits the serial numbers in vm_series_devices to the SCM
+# device registration API.
+# ==========================================
+- name: "STEP 9a — Claim Devices to SCM"
+  import_playbook: claim_devices.yml
+
+
+# ==========================================
+# STEP 9b — Initial Wait Before Bootstrap Polling
+# Gives SCM 60 seconds to register the newly claimed devices
+# before the first bootstrap status check.
+# ==========================================
+- name: "STEP 9b — Initial Wait Before Bootstrap Polling"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: 'Wait 60 seconds for SCM to register claimed devices'
+      ansible.builtin.pause:
+        seconds: 60
+        prompt: "Waiting 60s for SCM to register claimed devices before polling bootstrap status..."
+
+
+# ==========================================
+# STEP 9c — Bootstrap Status Polling
+# Polls SCM every 3 minutes for up to 15 minutes (5 checks).
+# Monitors ALL serials provided in vm_series_devices.
+# Succeeds when every device reports Bootstrap: DONE.
+# Fails the playbook if any device has not bootstrapped within
+# the polling window — manual investigation required in that case.
+# ==========================================
+- name: "STEP 9c — Bootstrap Status Polling"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+  vars:
+    scm_folder: "All"
+    scm_ngfw_base_url: "https://paas-16.prod.panorama.paloaltonetworks.com"
+    bootstrap_checks: 5      # 5 retries × 3 min = 15 min max
+    bootstrap_poll_delay: 180  # seconds between checks (3 minutes)
+
+  tasks:
+
+    - name: 'Authenticate with SCM'
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: 'Normalize vm_series_devices into a list'
+      ansible.builtin.set_fact:
+        serials_to_check: >-
+          {{ [vm_series_devices]
+             if (vm_series_devices is string and not vm_series_devices.startswith('['))
+             else (vm_series_devices | from_json if vm_series_devices is string else vm_series_devices) }}
+
+    - name: 'Display bootstrap polling plan'
+      ansible.builtin.debug:
+        msg:
+          - "=== Bootstrap Status Polling ==="
+          - "Devices  : {{ serials_to_check }}"
+          - "Checks   : {{ bootstrap_checks }}"
+          - "Interval : {{ bootstrap_poll_delay }}s ({{ (bootstrap_poll_delay | int / 60) | int }} minutes)"
+          - "Max wait : {{ (bootstrap_checks | int * bootstrap_poll_delay | int / 60) | int }} minutes"
+
+    - name: 'Poll SCM bootstrap status until all devices report DONE'
+      ansible.builtin.uri:
+        url: "{{ scm_ngfw_base_url }}/ngfw/api/bootstrap/getbootstrapstatus?folder={{ scm_folder }}"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: 200
+        return_content: yes
+      register: bootstrap_poll_result
+      retries: "{{ bootstrap_checks | int - 1 }}"
+      delay: "{{ bootstrap_poll_delay }}"
+      until: >-
+        (bootstrap_poll_result.content | from_json
+         | selectattr('serial', 'in', serials_to_check)
+         | rejectattr('bootstrap', 'equalto', 'done')
+         | list | length) == 0
+
+    - name: 'Parse bootstrap response for claimed devices'
+      ansible.builtin.set_fact:
+        bootstrap_statuses: >-
+          {{ bootstrap_poll_result.content | from_json
+             | selectattr('serial', 'in', serials_to_check) | list }}
+
+    - name: 'Display final bootstrap status per device'
+      ansible.builtin.debug:
+        msg:
+          - "Serial:    {{ item.serial }}"
+          - "Bootstrap: {{ item.bootstrap | upper }}"
+          - "Status:    {{ item.status }}"
+      loop: "{{ bootstrap_statuses }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    - name: 'Fail if any device did not complete bootstrap within polling window'
+      ansible.builtin.fail:
+        msg: >-
+          Device {{ item.serial }} did not complete bootstrap
+          (bootstrap: {{ item.bootstrap }}, status: {{ item.status }}).
+          Investigate in SCM before continuing.
+      when: item.bootstrap != 'done'
+      loop: "{{ bootstrap_statuses }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+# ==========================================
+# STEP 10 — Move Devices to SCM Folder
+# Iterates over every serial in vm_series_devices, finds its
+# entry UUID in the SCM folder tree, and moves it to target_folder.
+# Default folder: dick_prod (override with -e target_folder=other_folder)
+# ==========================================
+- name: "STEP 10 — Move Devices to SCM Folder"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+  vars:
+    target_folder: "dick_prod"
+    scm_sase_base_url: "https://paas-16.prod.panorama.paloaltonetworks.com"
+
+  tasks:
+
+    - name: 'Authenticate with SCM'
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: 'Normalize vm_series_devices into a list'
+      ansible.builtin.set_fact:
+        serials_to_move: >-
+          {{ [vm_series_devices]
+             if (vm_series_devices is string and not vm_series_devices.startswith('['))
+             else (vm_series_devices | from_json if vm_series_devices is string else vm_series_devices) }}
+
+    - name: 'Display move plan'
+      ansible.builtin.debug:
+        msg:
+          - "=== Moving Devices to SCM Folder ==="
+          - "Devices       : {{ serials_to_move }}"
+          - "Target folder : {{ target_folder }}"
+
+    - name: 'Fetch SCM folder tree'
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/folders?pagination=false"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        status_code: 200
+        return_content: yes
+      register: folders_response
+
+    - name: 'Build flat SCM folder node list'
+      ansible.builtin.set_fact:
+        scm_all_nodes: >-
+          {%- set l0 = folders_response.json.data -%}
+          {%- set l1 = l0 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l2 = l1 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l3 = l2 | map(attribute='children', default=[]) | flatten -%}
+          {{ l0 + l1 + l2 + l3 }}
+
+    - name: 'Resolve folder entry ID for each device'
+      ansible.builtin.set_fact:
+        device_folder_ids: >-
+          {{ device_folder_ids | default({}) | combine({
+               item: scm_all_nodes
+                     | selectattr('serial_number', 'defined')
+                     | selectattr('serial_number', 'equalto', item)
+                     | map(attribute='id') | first | default('')
+             }) }}
+      loop: "{{ serials_to_move }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: 'Fail if serial not found in SCM folder tree'
+      ansible.builtin.fail:
+        msg: >-
+          Serial '{{ item.key }}' was not found in the SCM folder tree.
+          Verify the device has been claimed and is visible in SCM.
+      when: item.value | length == 0
+      loop: "{{ device_folder_ids | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: 'Move device to folder {{ target_folder }}'
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/folders/{{ device_folder_ids[item] }}/move"
+        method: PUT
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          target_parent: "{{ target_folder }}"
+        status_code: 200
+        return_content: yes
+      register: move_results
+      loop: "{{ serials_to_move }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: 'Confirm device moves'
+      ansible.builtin.debug:
+        msg:
+          - "Moved successfully!"
+          - "Serial:          {{ item.json.serial_number }}"
+          - "Name:            {{ item.json.name }}"
+          - "Moved to folder: {{ target_folder }}"
+      loop: "{{ move_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+
+# ==========================================
+# STEP 11 — Post-change Network Snapshot and HTML Comparison Report
+# Takes a final network snapshot and generates an HTML diff report
+# comparing pre (Step 4) vs post (this step) network state:
+# ARP table, interface status, and static routes.
+# Output: ./reports/network_comparison_<hostname>_<timestamp>.html
+# ==========================================
+- name: "STEP 11 — Post-change Network Snapshot and Comparison Report"
+  import_playbook: post_snapshot_network_report.yml

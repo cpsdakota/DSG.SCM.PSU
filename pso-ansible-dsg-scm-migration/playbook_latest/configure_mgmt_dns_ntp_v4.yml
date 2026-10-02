@@ -1,0 +1,248 @@
+---
+# =============================================================================
+# Configure Management Interface, DNS and NTP on NGFW
+#
+# Flow:
+#   1. Run 'show system info' on the device to read the live management
+#      IP, netmask and gateway (works for both DHCP and static assignments).
+#   2. If mgmt_ip / mgmt_netmask / mgmt_gateway were passed via -e, those
+#      override the device-read values — use this to change the IP.
+#      If not passed, the device's current values are used automatically.
+#   3. Commit the resolved management IP/netmask/gateway locally.
+#   4. Configure DNS via xpath panos_config_element.
+#   5. Configure NTP via xpath panos_config_element.
+#   6. Commit all changes (ignore_errors: true — expected connection drop
+#      when management IP changes).
+#
+# Usage:
+#   Lock in current IP + set DNS/NTP (no -e needed for mgmt):
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01
+#
+#   Change management IP (override device-read values):
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01 \
+#       -e 'mgmt_ip=10.0.1.5 mgmt_netmask=255.255.255.0 mgmt_gateway=10.0.1.1'
+#
+#   Specific list via variable:
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'firewall_list=["dicks-vmseries-lab22-firewall01"]'
+#
+# Variables (all optional):
+#   mgmt_ip          — override management IP    (default: read from device)
+#   mgmt_netmask     — override netmask          (default: read from device)
+#   mgmt_gateway     — override default gateway  (default: read from device)
+#   dns_primary      — primary DNS server        (default: 8.8.8.8)
+#   dns_secondary    — secondary DNS server      (default: 8.8.4.4)
+#   ntp_primary      — primary NTP server        (default: 0.pool.ntp.org)
+#   ntp_secondary    — secondary NTP server      (default: 1.pool.ntp.org)
+#   firewall_list    — optional list to target specific hosts
+# =============================================================================
+
+- hosts: firewalls
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    dns_primary:   "10.220.150.50"
+    dns_secondary: "10.211.36.50"
+    ntp_primary:   "10.220.60.71"
+    ntp_secondary: "10.211.12.71"
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: 'Set target firewall provider information'
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+      no_log: true
+
+    # ==========================================
+    # Read live management IP from device
+    # 'show system info' always returns the
+    # actual operational IP regardless of
+    # whether it is DHCP or statically assigned.
+    # ==========================================
+
+    - name: 'MGMT — Read live system info from device'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'show system info'
+        cmd_is_xml: false
+      register: system_info_raw
+
+    - name: 'MGMT — Extract management IP, netmask and gateway from device'
+      ansible.builtin.set_fact:
+        _device_mgmt_ip:      "{{ (system_info_raw.stdout | from_json).response.result.system['ip-address']     | default('') }}"
+        _device_mgmt_netmask: "{{ (system_info_raw.stdout | from_json).response.result.system.netmask           | default('') }}"
+        _device_mgmt_gateway: "{{ (system_info_raw.stdout | from_json).response.result.system['default-gateway'] | default('') }}"
+
+    - name: 'MGMT — Resolve effective values (user override or device current)'
+      ansible.builtin.set_fact:
+        effective_mgmt_ip:      "{{ mgmt_ip      if (mgmt_ip      is defined and mgmt_ip      | length > 0) else _device_mgmt_ip }}"
+        effective_mgmt_netmask: "{{ mgmt_netmask if (mgmt_netmask is defined and mgmt_netmask | length > 0) else _device_mgmt_netmask }}"
+        effective_mgmt_gateway: "{{ mgmt_gateway if (mgmt_gateway is defined and mgmt_gateway | length > 0) else _device_mgmt_gateway }}"
+
+    - name: 'Display operation target'
+      ansible.builtin.debug:
+        msg:
+          - "=== Configuring Management Interface, DNS and NTP ==="
+          - "Firewall      : {{ inventory_hostname }}"
+          - "IP Address    : {{ panorama_host }}"
+          - "--- Management Interface ---"
+          - "IP (device)   : {{ _device_mgmt_ip }}"
+          - "IP (effective): {{ effective_mgmt_ip }}{{ ' (user override)' if (mgmt_ip is defined and mgmt_ip | length > 0) else ' (from device)' }}"
+          - "Netmask       : {{ effective_mgmt_netmask }}"
+          - "Gateway       : {{ effective_mgmt_gateway }}"
+          - "--- DNS ---"
+          - "Primary       : {{ dns_primary }}"
+          - "Secondary     : {{ dns_secondary }}"
+          - "--- NTP ---"
+          - "Primary       : {{ ntp_primary }}"
+          - "Secondary     : {{ ntp_secondary }}"
+
+    # ==========================================
+    # Commit management IP/netmask/gateway
+    # Uses effective values — always runs so
+    # the local config always has the mgmt IP,
+    # even on DHCP-managed devices.
+    # ==========================================
+
+    - name: 'MGMT — Set management IP locally'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system"
+        element: "<ip-address>{{ effective_mgmt_ip }}</ip-address>"
+      register: result_mgmt_ip
+      ignore_errors: true
+      when: effective_mgmt_ip | length > 0
+
+    - name: 'MGMT — Set management netmask locally'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system"
+        element: "<netmask>{{ effective_mgmt_netmask }}</netmask>"
+      register: result_mgmt_netmask
+      ignore_errors: true
+      when: effective_mgmt_netmask | length > 0
+
+    - name: 'MGMT — Set management default gateway locally'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system"
+        element: "<default-gateway>{{ effective_mgmt_gateway }}</default-gateway>"
+      register: result_mgmt_gateway
+      ignore_errors: true
+      when: effective_mgmt_gateway | length > 0
+
+    # ==========================================
+    # Configure DNS (xpath — from configure_dns_ntp.yml)
+    # ==========================================
+
+    - name: 'Configure primary DNS server'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/dns-setting/servers"
+        element: "<primary>{{ dns_primary }}</primary>"
+      register: result_dns_primary
+
+    - name: 'Configure secondary DNS server'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/dns-setting/servers"
+        element: "<secondary>{{ dns_secondary }}</secondary>"
+      register: result_dns_secondary
+
+    - name: 'Display DNS configuration result'
+      ansible.builtin.debug:
+        msg:
+          - "DNS primary   : {{ dns_primary }}  — {{ 'SUCCESS' if result_dns_primary is succeeded else 'FAILED' }}"
+          - "DNS secondary : {{ dns_secondary }} — {{ 'SUCCESS' if result_dns_secondary is succeeded else 'FAILED' }}"
+
+    # ==========================================
+    # Configure NTP (xpath — from configure_dns_ntp.yml)
+    # ==========================================
+
+    - name: 'Configure primary NTP server'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/ntp-servers/primary-ntp-server"
+        element: "<ntp-server-address>{{ ntp_primary }}</ntp-server-address>"
+      register: result_ntp_primary
+
+    - name: 'Configure secondary NTP server'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/ntp-servers/secondary-ntp-server"
+        element: "<ntp-server-address>{{ ntp_secondary }}</ntp-server-address>"
+      register: result_ntp_secondary
+
+    - name: 'Display NTP configuration result'
+      ansible.builtin.debug:
+        msg:
+          - "NTP primary   : {{ ntp_primary }}  — {{ 'SUCCESS' if result_ntp_primary is succeeded else 'FAILED' }}"
+          - "NTP secondary : {{ ntp_secondary }} — {{ 'SUCCESS' if result_ntp_secondary is succeeded else 'FAILED' }}"
+
+    - name: 'MGMT — Set management interface type to static'
+      paloaltonetworks.panos.panos_config_element:
+        provider: '{{ provider }}'
+        xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system"
+        element: "<type><static/></type>"
+      register: result_mgmt_type
+      ignore_errors: true
+      when: effective_mgmt_ip | length > 0
+
+    - name: 'Display management interface results'
+      ansible.builtin.debug:
+        msg:
+          - "Mgmt IP      : {{ effective_mgmt_ip }}      — {{ 'SUCCESS' if result_mgmt_ip is succeeded else ('SKIPPED' if result_mgmt_ip is skipped else 'FAILED') }}"
+          - "Mgmt netmask : {{ effective_mgmt_netmask }} — {{ 'SUCCESS' if result_mgmt_netmask is succeeded else ('SKIPPED' if result_mgmt_netmask is skipped else 'FAILED') }}"
+          - "Mgmt gateway : {{ effective_mgmt_gateway }} — {{ 'SUCCESS' if result_mgmt_gateway is succeeded else ('SKIPPED' if result_mgmt_gateway is skipped else 'FAILED') }}"
+          - "Mgmt type → static                         — {{ 'SUCCESS' if result_mgmt_type is succeeded else ('SKIPPED' if result_mgmt_type is skipped else 'FAILED') }}"
+
+    # ==========================================
+    # Commit all changes
+    # ignore_errors: true because changing the
+    # management IP drops the connection during
+    # or after commit — this is expected.
+    # ==========================================
+
+    - name: 'Commit all configuration changes'
+      paloaltonetworks.panos.panos_commit_firewall:
+        provider: '{{ provider }}'
+        description: "Configure management interface, DNS and NTP via Ansible"
+      register: result_commit
+      ignore_errors: true
+
+    # ==========================================
+    # Final Summary
+    # ==========================================
+
+    - name: 'Display completion summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== Configuration Complete for {{ inventory_hostname }} ==="
+          - "DNS primary    : {{ 'SUCCESS' if result_dns_primary is succeeded else 'FAILED' }}"
+          - "DNS secondary  : {{ 'SUCCESS' if result_dns_secondary is succeeded else 'FAILED' }}"
+          - "NTP primary    : {{ 'SUCCESS' if result_ntp_primary is succeeded else 'FAILED' }}"
+          - "NTP secondary  : {{ 'SUCCESS' if result_ntp_secondary is succeeded else 'FAILED' }}"
+          - "Mgmt IP ({{ effective_mgmt_ip }})      : {{ 'SUCCESS' if (result_mgmt_ip is succeeded) else ('SKIPPED' if result_mgmt_ip is skipped else 'FAILED') }}"
+          - "Mgmt mask ({{ effective_mgmt_netmask }}) : {{ 'SUCCESS' if (result_mgmt_netmask is succeeded) else ('SKIPPED' if result_mgmt_netmask is skipped else 'FAILED') }}"
+          - "Mgmt gw ({{ effective_mgmt_gateway }})   : {{ 'SUCCESS' if (result_mgmt_gateway is succeeded) else ('SKIPPED' if result_mgmt_gateway is skipped else 'FAILED') }}"
+          - "Mgmt type → static                       : {{ 'SUCCESS' if (result_mgmt_type is succeeded) else ('SKIPPED' if result_mgmt_type is skipped else 'FAILED') }}"
+          - "Commit         : {{ 'SUCCESS' if result_commit is succeeded else 'FAILED or connection dropped (expected if mgmt IP changed)' }}"

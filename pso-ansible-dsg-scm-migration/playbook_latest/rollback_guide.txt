@@ -1,0 +1,68 @@
+Summary of Ansible Playbooks for Rollback:
+
+  ┌───────────────────────────────────┬───────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │               File                │ Lines │                                                               Purpose                                                               │
+  ├───────────────────────────────────┼───────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ disable_advanced_routing.yml      │ 177   │ Mirror of enable_advanced_routing.yml. Sets advance-routing=no, commits, reboots, verifies disabled.                                │
+  ├───────────────────────────────────┼───────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ reenable_panorama_management.yml  │ 184   │ Removes <cloud-service/>, sets <panorama-server> to the on-prem Panorama IP (auto-resolved from inventory's panorama group →        │
+  │                                   │       │ ip of panorama), commits, then re-enables template & shared-policy push via CLI ops.                                                   │
+  ├───────────────────────────────────┼───────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │                                   │       │ Two stages: (A) DELETE Configuration Scope → moves Cloud-Managed → Monitoring-only (documented endpoint), (B) attempts to release   │
+  │ unclaim_devices_from_scm.yml      │ 160   │ device registration → Monitoring → Available (best-guess endpoint, non-fatal with full response shown for the                       │
+  │                                   │       │ DevTools-capture-and-correct loop).                                                                                                 │
+  ├───────────────────────────────────┼───────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │                                   │       │ The firewall-direct counterpart of import_device_state_to_panorama.yml (which we proved doesn't work — Panorama's API doesn't       │
+  │ import_device_state_firewall.yml  │ 146   │ accept device-state). Uses panos_import against the firewall provider directly with the .tgz from save_device_state.yml, then       │
+  │                                   │       │ commits.                                                                                                                            │
+  ├───────────────────────────────────┼───────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ rollback_firewall_to_panorama.yml │ 96    │ Master orchestrator. Uses import_playbook to run all four in order. Tags on each stage allow --skip-tags unclaim (since you said    │
+  │                                   │       │ Stage 3 isn't mandatory) or --tags <stage> to run just one.                                                                         │
+  └───────────────────────────────────┴───────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Key design notes
+
+  reenable_panorama_management.yml
+
+  - Auto-resolves Panorama IP from hostvars[groups['panorama'][0]].panorama_host (= 13.72.98.89 in your inventory). No -e flag needed in normal use.
+  - Override available: -e panorama_server_ip=... if you ever need to point elsewhere.
+  - The cloud-service removal is wrapped in ignore_errors: true because if it wasn't actually set (idempotent re-run), the DELETE returns an error that's safe to swallow.
+
+  unclaim_devices_from_scm.yml — Stage B is a guess
+
+  The claim endpoint we found is https://admin.prod.panorama.paloaltonetworks.com/api/v2/device-registrations/claim. The release/unclaim endpoint isn't documented anywhere in the
+  repo, so I guessed by symmetry: DELETE /api/v2/device-registrations/devices/{serial}. If it fails, the playbook shows the full URL + response body — capture the real endpoint by
+  clicking "Remove" on a device in the SCM UI with DevTools open, paste the request URL/method/body, and I'll patch the URI task in one edit (same pattern we used for STEP 8D rename).
+
+  import_device_state_firewall.yml — the working one
+
+  Same logic as import_device_state_to_panorama.yml but the provider points at the firewall (using panorama_host from inventory as the firewall IP), and we know panos_import with
+  category: device-state works against the firewall (we proved this is a firewall-only operation when the Panorama upload failed). The commit afterward has ignore_errors: true because
+  the restored config can change mgmt IP / Panorama IP / etc., and the connection may drop during commit — that's expected behavior on a state restore.
+
+  rollback_firewall_to_panorama.yml — order rationale
+
+  Stage 1: disable advanced routing (reboot)
+  Stage 2: re-enable Panorama mgmt
+  Stage 3: unclaim from SCM            ← optional
+  Stage 4: import device state         ← last, overlays final state
+
+
+  Usage examples:
+
+  Full rollback for one firewall:
+  ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+    --vault-password-file .vault_pass \
+    --limit firewall_name,localhost \
+
+  Skip the SCM unclaim (Stage 3) since it's optional:
+  ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+    --vault-password-file .vault_pass \
+    --limit firewall_name,localhost \
+    --skip-tags unclaim
+    
+  Run just one stage (handy for testing each in isolation):
+  ansible-playbook playbook_latest/rollback_firewall_to_panorama.yml \
+    --vault-password-file .vault_pass \
+    --limit firewall_name,localhost \
+    --tags disable_routing       # or: reenable_panorama / unclaim / import_state

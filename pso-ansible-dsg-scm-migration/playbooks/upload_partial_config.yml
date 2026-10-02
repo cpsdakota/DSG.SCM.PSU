@@ -1,0 +1,173 @@
+---
+# Upload and merge a partial XML config file to a Palo Alto firewall.
+#
+# Usage:
+#   All firewalls (each gets its own config file):
+#     ansible-playbook playbooks/upload_partial_config.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'config_file=BOM-AWS-EFC-dummy.xml'
+#
+#   Specific firewall only:
+#     ansible-playbook playbooks/upload_partial_config.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'config_file=BOM-AWS-EFC-dummy.xml firewall_list=["dicks-vmseries-lab-firewall01"]'
+#
+# Variables:
+#   config_file  (required) - path to the XML file to upload, relative to the project root
+#   load_mode    (optional) - 'merge' (default) or 'replace'
+#   commit_after (optional) - true (default) or false to skip commit
+
+- hosts: 'firewalls'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    load_mode: "merge"
+    commit_after: true
+    # Optional: filter specific firewalls via variable
+    # firewall_list: ["dicks-vmseries-lab-firewall01"]
+
+  tasks:
+
+  - name: 'Verify config_file variable is defined'
+    ansible.builtin.fail:
+      msg: "You must provide the config_file variable. Example: -e 'config_file=BOM-AWS-EFC-dummy.xml'"
+    when: config_file is not defined
+    run_once: true
+
+  - name: 'Resolve config file absolute path'
+    ansible.builtin.set_fact:
+      config_file_abs: "{{ config_file if config_file.startswith('/') else (playbook_dir ~ '/../' ~ config_file) }}"
+    run_once: true
+
+  - name: 'Verify config file exists on control node'
+    ansible.builtin.stat:
+      path: "{{ config_file_abs }}"
+    register: config_file_stat
+    delegate_to: localhost
+    run_once: true
+
+  - name: 'Fail if config file not found'
+    ansible.builtin.fail:
+      msg: "Config file not found: {{ config_file_abs }}"
+    when: not config_file_stat.stat.exists
+    run_once: true
+
+  - name: 'Check if running for specific firewalls only'
+    ansible.builtin.set_fact:
+      run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+  - name: 'Skip host if not in firewall_list'
+    ansible.builtin.meta: end_host
+    when: not (run_for_this_host | bool)
+
+  - name: 'Set target firewall provider information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+    no_log: true
+
+  - name: 'Display upload target information'
+    ansible.builtin.debug:
+      msg:
+        - "=== Uploading Partial Config to Firewall ==="
+        - "Firewall: {{ inventory_hostname }}"
+        - "IP Address: {{ panorama_host }}"
+        - "Config File: {{ config_file }}"
+        - "Load Mode: {{ load_mode }}"
+        - "Commit After Upload: {{ commit_after }}"
+
+  # ==========================================
+  # Upload Config File
+  # ==========================================
+
+  - name: 'Upload config file to firewall'
+    paloaltonetworks.panos.panos_import:
+      provider: '{{ target_device.provider }}'
+      category: 'configuration'
+      file: '{{ config_file_abs }}'
+    register: upload_response
+
+  - name: 'Display upload status'
+    ansible.builtin.debug:
+      msg: "Config file '{{ config_file | basename }}' uploaded successfully to {{ inventory_hostname }}"
+
+  # ==========================================
+  # Load Config into Candidate Config
+  # ==========================================
+
+  - name: 'Obtain PAN-OS API key for load operation'
+    ansible.builtin.uri:
+      url: "https://{{ panorama_host }}/api/?type=keygen&user={{ username | urlencode }}&password={{ password | urlencode }}"
+      method: GET
+      validate_certs: false
+      return_content: true
+    register: keygen_response
+    no_log: true
+
+  - name: 'Parse API key'
+    ansible.builtin.set_fact:
+      fw_api_key: "{{ keygen_response.content | regex_search('<key>(.*?)</key>', '\\1') | first }}"
+    no_log: true
+
+  - name: 'Load config in {{ load_mode }} mode'
+    ansible.builtin.uri:
+      url: "https://{{ panorama_host }}/api/"
+      method: POST
+      body_format: form-urlencoded
+      body:
+        type: op
+        key: "{{ fw_api_key }}"
+        cmd: "<load><config><partial><mode>{{ load_mode }}</mode><from-xpath>/config/devices</from-xpath><to-xpath>/config/devices</to-xpath><from>{{ config_file | basename }}</from></partial></config></load>"
+      validate_certs: false
+      return_content: true
+    register: load_response
+    no_log: true
+
+  - name: 'Verify load succeeded'
+    ansible.builtin.fail:
+      msg: "Config load failed: {{ load_response.content }}"
+    when: "'success' not in load_response.content"
+
+  - name: 'Display load status'
+    ansible.builtin.debug:
+      msg: "Config loaded successfully in '{{ load_mode }}' mode on {{ inventory_hostname }}"
+
+  # ==========================================
+  # Commit Configuration Changes
+  # ==========================================
+
+  - name: 'Commit configuration changes to firewall'
+    paloaltonetworks.panos.panos_commit_firewall:
+      provider: '{{ target_device.provider }}'
+      description: "Partial config upload - {{ config_file | basename }}"
+    register: commit_result
+    when: commit_after | bool
+
+  - name: 'Display commit status'
+    ansible.builtin.debug:
+      msg: "Configuration committed successfully to {{ inventory_hostname }}"
+    when: commit_after | bool and commit_result is succeeded
+
+  - name: 'Display skipped commit notice'
+    ansible.builtin.debug:
+      msg: "Commit skipped for {{ inventory_hostname }} — run commit manually to apply changes"
+    when: not (commit_after | bool)
+
+  # ==========================================
+  # Final Summary
+  # ==========================================
+
+  - name: 'Display completion summary'
+    ansible.builtin.debug:
+      msg:
+        - "=== Config Upload Complete for {{ inventory_hostname }} ==="
+        - "File Uploaded: {{ config_file | basename }}"
+        - "Load Mode: {{ load_mode }}"
+        - "Committed: {{ commit_after | bool }}"

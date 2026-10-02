@@ -1,0 +1,48 @@
+---
+- name: Claim VM series devices to SCM
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+  vars:
+    # Replace with your actual serial numbers or pass via -e
+    # vm_series_devices: "007957000815595"
+    # vm_series_devices: ["007957000815595","007957000815592"]
+    device_labels: []  # Add label IDs if needed
+  tasks:
+    - name: Authenticate with SCM
+      include_role:
+        name: scm_auth
+
+    - name: Normalize serial numbers into a proper list
+      ansible.builtin.set_fact:
+        vm_devices_list: "{{ [vm_series_devices] if (vm_series_devices is string and not vm_series_devices.startswith('[')) else (vm_series_devices | from_json if vm_series_devices is string else vm_series_devices) }}"
+
+    - name: Display devices to be claimed
+      debug:
+        msg: "Claiming {{ vm_devices_list | length }} VM series devices: {{ vm_devices_list }}"
+
+    - name: Claim devices to SCM
+      uri:
+        url: "https://admin.prod.panorama.paloaltonetworks.com/api/v2/device-registrations/claim"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          devices: "{{ vm_devices_list }}"
+          labels: "{{ device_labels }}"
+        status_code: 200
+        return_content: yes
+      register: claim_response
+
+    - name: Display claim results
+      debug:
+        var: claim_response.json
+
+    - name: Show device status
+      debug:
+        msg: "Serial: {{ item.serial_number }} | Status: {{ item.association_status }}"
+      loop: "{{ claim_response.json.devices }}"
+      when: claim_response.json.devices is defined

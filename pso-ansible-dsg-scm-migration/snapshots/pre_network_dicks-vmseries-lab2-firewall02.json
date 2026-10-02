@@ -1,0 +1,8 @@
+{
+    "arp_xml": "<response status=\"success\"><result>\n  <dp>dp0</dp>\n  <timeout>1800</timeout>\n  <total>0</total>\n  <entries />\n  <max>32000</max>\n</result></response>",
+    "device": "dicks-vmseries-lab2-firewall02",
+    "interfaces_xml": "<response status=\"success\"><result>\n  <hw>\n    <entry>\n      <name>ethernet1/3</name>\n      <id>18</id>\n      <type>0</type>\n      <mac>00:00:00:00:00:00</mac>\n      <speed>ukn</speed>\n      <duplex>ukn</duplex>\n      <state>down</state>\n      <mode>(autoneg)</mode>\n      <fec>auto</fec>\n      <st>ukn/ukn/down(autoneg)</st>\n    </entry>\n    <entry>\n      <name>ethernet1/4</name>\n      <id>19</id>\n      <type>0</type>\n      <mac>00:00:00:00:00:00</mac>\n      <speed>ukn</speed>\n      <duplex>ukn</duplex>\n      <state>down</state>\n      <mode>(autoneg)</mode>\n      <fec>auto</fec>\n      <st>ukn/ukn/down(autoneg)</st>\n    </entry>\n  </hw>\n  <ifnet>\n    <entry>\n      <name>ethernet1/3</name>\n      <id>18</id>\n      <tag>0</tag>\n      <vsys>1</vsys>\n      <zone>internet</zone>\n      <fwd>lr:default</fwd>\n      <ip>N/A</ip>\n      <addr />\n      <dyn-addr />\n      <addr6 />\n    </entry>\n    <entry>\n      <name>ethernet1/4</name>\n      <id>19</id>\n      <tag>0</tag>\n      <vsys>1</vsys>\n      <zone>local</zone>\n      <fwd>lr:default</fwd>\n      <ip>N/A</ip>\n      <addr />\n      <dyn-addr />\n      <addr6 />\n    </entry>\n  </ifnet>\n</result></response>",
+    "ip": "172.174.233.23",
+    "routes_xml": "<response status=\"success\"><result>\n  <json>{}</json>\n</result></response>",
+    "timestamp": "2026-03-31 23:28:37"
+}

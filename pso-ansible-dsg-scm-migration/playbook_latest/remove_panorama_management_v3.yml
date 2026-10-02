@@ -1,0 +1,167 @@
+---
+# =============================================================================
+# Remove Panorama Management from Firewalls — v3 (Disable then Re-enable)
+#
+# Uses PAN-OS operational CLI commands instead of xpath config element edits:
+#
+#   set system setting template disable / enable
+#     → Stops / resumes the firewall receiving Device and Network Template
+#       configuration from Panorama.
+#
+#   set system setting shared-policy disable / enable
+#     → Stops / resumes the firewall receiving Device Group policies and
+#       objects from Panorama.
+#
+# Flow:
+#   1. Disable template push
+#   2. Disable shared-policy push
+#   3. Re-enable template push
+#   4. Re-enable shared-policy push
+#
+# All four commands take effect immediately (no commit required).
+#
+# Usage:
+#   All firewalls:
+#     ansible-playbook playbook_latest/remove_panorama_management_v3.yml \
+#       --vault-password-file .vault_pass
+#
+#   Single firewall:
+#     ansible-playbook playbook_latest/remove_panorama_management_v3.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01
+#
+#   Specific list via variable:
+#     ansible-playbook playbook_latest/remove_panorama_management_v3.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'firewall_list=["dicks-vmseries-lab22-firewall01"]'
+# =============================================================================
+
+- hosts: firewalls
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: 'Set target firewall provider information'
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+      no_log: true
+
+    - name: 'Display operation target'
+      ansible.builtin.debug:
+        msg:
+          - "=== Disabling then Re-enabling Panorama Management on Firewall ==="
+          - "Firewall  : {{ inventory_hostname }}"
+          - "IP Address: {{ panorama_host }}"
+          - "Method    : CLI operational commands (no xpath)"
+          - "Commands  : set system setting template disable"
+          - "            set system setting shared-policy disable"
+          - "            set system setting template enable"
+          - "            set system setting shared-policy enable"
+
+    # ==========================================
+    # Disable Device and Network Template
+    # Stops the firewall from receiving template
+    # configuration pushed from Panorama.
+    # ==========================================
+
+    - name: 'Disable Device and Network Template (set system setting template disable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting template disable'
+        cmd_is_xml: false
+      register: result_template_disable
+      ignore_errors: true
+
+    - name: 'Display template disable result'
+      ansible.builtin.debug:
+        msg:
+          - "Template disable status : {{ 'SUCCESS' if result_template_disable is succeeded else 'FAILED' }}"
+          - "Output                  : {{ result_template_disable.stdout_xml | default(result_template_disable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Disable Panorama Policy and Objects
+    # Stops the firewall from receiving Device Group
+    # policies and objects pushed from Panorama.
+    # ==========================================
+
+    - name: 'Disable Panorama Policy and Objects (set system setting shared-policy disable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting shared-policy disable'
+        cmd_is_xml: false
+      register: result_shared_policy_disable
+      ignore_errors: true
+
+    - name: 'Display shared-policy disable result'
+      ansible.builtin.debug:
+        msg:
+          - "Shared-policy disable status : {{ 'SUCCESS' if result_shared_policy_disable is succeeded else 'FAILED' }}"
+          - "Output                       : {{ result_shared_policy_disable.stdout_xml | default(result_shared_policy_disable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Re-enable Device and Network Template
+    # Resumes receiving template configuration
+    # pushed from Panorama.
+    # ==========================================
+
+    - name: 'Enable Device and Network Template (set system setting template enable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting template enable'
+        cmd_is_xml: false
+      register: result_template_enable
+      ignore_errors: true
+
+    - name: 'Display template enable result'
+      ansible.builtin.debug:
+        msg:
+          - "Template enable status : {{ 'SUCCESS' if result_template_enable is succeeded else 'FAILED' }}"
+          - "Output                 : {{ result_template_enable.stdout_xml | default(result_template_enable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Re-enable Panorama Policy and Objects
+    # Resumes receiving Device Group policies and
+    # objects pushed from Panorama.
+    # ==========================================
+
+    - name: 'Enable Panorama Policy and Objects (set system setting shared-policy enable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting shared-policy enable'
+        cmd_is_xml: false
+      register: result_shared_policy_enable
+      ignore_errors: true
+
+    - name: 'Display shared-policy enable result'
+      ansible.builtin.debug:
+        msg:
+          - "Shared-policy enable status : {{ 'SUCCESS' if result_shared_policy_enable is succeeded else 'FAILED' }}"
+          - "Output                      : {{ result_shared_policy_enable.stdout_xml | default(result_shared_policy_enable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Final Summary
+    # ==========================================
+
+    - name: 'Display completion summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== Panorama Management Disable+Re-enable Complete for {{ inventory_hostname }} ==="
+          - "Template push  disabled  : {{ 'SUCCESS' if result_template_disable       is succeeded else 'FAILED — check output above' }}"
+          - "Shared-policy  disabled  : {{ 'SUCCESS' if result_shared_policy_disable  is succeeded else 'FAILED — check output above' }}"
+          - "Template push  re-enabled: {{ 'SUCCESS' if result_template_enable        is succeeded else 'FAILED — check output above' }}"
+          - "Shared-policy  re-enabled: {{ 'SUCCESS' if result_shared_policy_enable   is succeeded else 'FAILED — check output above' }}"
+          - "Note: All commands take effect immediately. No commit required."

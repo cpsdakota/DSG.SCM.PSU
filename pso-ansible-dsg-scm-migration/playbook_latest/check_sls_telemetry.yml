@@ -1,0 +1,263 @@
+---
+# Health check playbook for SLS (Strata Logging Service) and Device Telemetry
+# on Palo Alto NGFW firewalls.
+#
+# Usage:
+#   All firewalls:
+#     ansible-playbook playbooks/check_sls_telemetry.yml --vault-password-file .vault_pass
+#
+#   Specific firewall:
+#     ansible-playbook playbooks/check_sls_telemetry.yml --vault-password-file .vault_pass \
+#       -e 'firewall_list=["dicks-vmseries-lab-firewall02"]'
+
+- hosts: 'firewalls'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Optional: filter specific firewalls via variable
+    # firewall_list: ["dicks-vmseries-lab-firewall01"]
+
+  tasks:
+
+  - name: 'Check if running for specific firewalls only'
+    ansible.builtin.set_fact:
+      run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+  - name: 'Skip host if not in firewall_list'
+    ansible.builtin.meta: end_host
+    when: not (run_for_this_host | bool)
+
+  - name: 'Set target firewall provider information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+    no_log: true
+
+  - name: 'Display check target information'
+    ansible.builtin.debug:
+      msg:
+        - "=== SLS & Telemetry Health Check ==="
+        - "Firewall : {{ inventory_hostname }}"
+        - "IP       : {{ panorama_host }}"
+
+  # ==========================================
+  # Collect Data from Firewall
+  # ==========================================
+
+  - name: 'Get SLS forwarding status'
+    paloaltonetworks.panos.panos_op:
+      provider: '{{ target_device.provider }}'
+      cmd: 'request logging-service-forwarding status'
+    register: sls_status_raw
+    ignore_errors: true
+
+  - name: 'Get SLS customer info'
+    paloaltonetworks.panos.panos_op:
+      provider: '{{ target_device.provider }}'
+      cmd: 'request logging-service-forwarding customerinfo show'
+    register: sls_customerinfo_raw
+    ignore_errors: true
+
+  - name: 'Get Telemetry settings'
+    paloaltonetworks.panos.panos_op:
+      provider: '{{ target_device.provider }}'
+      cmd: 'show device-telemetry settings'
+    register: telemetry_settings_raw
+    ignore_errors: true
+
+  - name: 'Get Telemetry stats (all categories)'
+    paloaltonetworks.panos.panos_op:
+      provider: '{{ target_device.provider }}'
+      cmd: 'show device-telemetry stats all'
+    register: telemetry_stats_raw
+    ignore_errors: true
+
+  - name: 'Get Telemetry details'
+    paloaltonetworks.panos.panos_op:
+      provider: '{{ target_device.provider }}'
+      cmd: 'show device-telemetry details'
+    register: telemetry_details_raw
+    ignore_errors: true
+
+  # ==========================================
+  # Parse Raw Output Into Readable Text
+  # ==========================================
+
+  - name: 'Parse command outputs into plain text'
+    ansible.builtin.set_fact:
+      sls_text: "{{ sls_status_raw.stdout_xml | default('') }}"
+      sls_customerinfo_text: "{{ sls_customerinfo_raw.stdout_xml | default('') }}"
+      telemetry_settings_text: "{{ telemetry_settings_raw.stdout_xml | default('') }}"
+      telemetry_stats_text: "{{ telemetry_stats_raw.stdout_xml | default('') }}"
+      telemetry_details_text: "{{ telemetry_details_raw.stdout_xml | default('') }}"
+
+  - name: 'DEBUG: Show raw command outputs (to verify field content)'
+    ansible.builtin.debug:
+      msg:
+        - "--- SLS Status ---"
+        - "{{ sls_text }}"
+        - "--- SLS Customer Info ---"
+        - "{{ sls_customerinfo_text }}"
+        - "--- Telemetry Settings ---"
+        - "{{ telemetry_settings_text }}"
+        - "--- Telemetry Stats ---"
+        - "{{ telemetry_stats_text }}"
+        - "--- Telemetry Details ---"
+        - "{{ telemetry_details_text }}"
+
+  # ==========================================
+  # SLS Health Checks
+  # ==========================================
+
+  - name: 'CHECK: SLS - Logging Service is licensed'
+    ansible.builtin.assert:
+      that:
+        - "'<lcaas_licensed>Yes</lcaas_licensed>' in sls_text"
+      fail_msg: "FAIL - Logging Service is NOT licensed on {{ inventory_hostname }}"
+      success_msg: "PASS - Logging Service is licensed"
+    ignore_errors: true
+    register: check_sls_licensed
+
+  - name: 'CHECK: SLS - Forwarding is enabled'
+    ansible.builtin.assert:
+      that:
+        - "'<lcaas_enabled>Yes</lcaas_enabled>' in sls_text"
+      fail_msg: "FAIL - Logging Service forwarding is NOT enabled on {{ inventory_hostname }}"
+      success_msg: "PASS - Logging Service forwarding is enabled"
+    ignore_errors: true
+    register: check_sls_forwarding
+
+  - name: 'CHECK: SLS - Customer info fetched (Ingest FQDN present)'
+    ansible.builtin.assert:
+      that:
+        - "'<ingest-fqdn>' in sls_customerinfo_text"
+      fail_msg: "FAIL - SLS customer info not fetched on {{ inventory_hostname }}"
+      success_msg: "PASS - SLS customer info is present"
+    ignore_errors: true
+    register: check_sls_customerinfo
+
+  - name: 'CHECK: SLS - License fetch status is Success'
+    ansible.builtin.assert:
+      that:
+        - "'LCaaS license key installed successfully' in sls_text"
+      fail_msg: "FAIL - SLS license fetch did not succeed on {{ inventory_hostname }}"
+      success_msg: "PASS - SLS license fetch succeeded"
+    ignore_errors: true
+    register: check_sls_license_fetch
+
+  # ==========================================
+  # Telemetry Health Checks
+  # ==========================================
+
+  - name: 'CHECK: Telemetry - Device certificate is valid'
+    ansible.builtin.assert:
+      that:
+        - "'Device Certificate is valid' in telemetry_settings_text"
+      fail_msg: "FAIL - Telemetry device certificate is NOT valid on {{ inventory_hostname }}"
+      success_msg: "PASS - Telemetry device certificate is valid"
+    ignore_errors: true
+    register: check_telemetry_cert
+
+  - name: 'CHECK: Telemetry - Device Health Performance is enabled'
+    ansible.builtin.assert:
+      that:
+        - "'<device-health-performance>yes</device-health-performance>' in telemetry_settings_text"
+      fail_msg: "FAIL - Device Health Performance telemetry is NOT enabled on {{ inventory_hostname }}"
+      success_msg: "PASS - Device Health Performance telemetry is enabled"
+    ignore_errors: true
+    register: check_telemetry_health
+
+  - name: 'CHECK: Telemetry - Product Usage is enabled'
+    ansible.builtin.assert:
+      that:
+        - "'<product-usage>yes</product-usage>' in telemetry_settings_text"
+      fail_msg: "FAIL - Product Usage telemetry is NOT enabled on {{ inventory_hostname }}"
+      success_msg: "PASS - Product Usage telemetry is enabled"
+    ignore_errors: true
+    register: check_telemetry_usage
+
+  - name: 'CHECK: Telemetry - Threat Prevention is enabled'
+    ansible.builtin.assert:
+      that:
+        - "'<threat-prevention>yes</threat-prevention>' in telemetry_settings_text"
+      fail_msg: "FAIL - Threat Prevention telemetry is NOT enabled on {{ inventory_hostname }}"
+      success_msg: "PASS - Threat Prevention telemetry is enabled"
+    ignore_errors: true
+    register: check_telemetry_threat
+
+  - name: 'CHECK: Telemetry - All categories reporting success'
+    ansible.builtin.assert:
+      that:
+        - "telemetry_stats_text | regex_findall('<status>success</status>') | length >= 3"
+      fail_msg: "FAIL - Not all telemetry categories are reporting 'status: success' on {{ inventory_hostname }}"
+      success_msg: "PASS - All telemetry categories (health, usage, threat) are reporting success"
+    ignore_errors: true
+    register: check_telemetry_stats
+
+  - name: 'CHECK: Telemetry - No failed upload attempts'
+    ansible.builtin.assert:
+      that:
+        - "telemetry_stats_text | regex_findall('<num-of-failed-attempts>0</num-of-failed-attempts>') | length >= 3"
+      fail_msg: "FAIL - One or more telemetry categories have failed upload attempts on {{ inventory_hostname }}"
+      success_msg: "PASS - No failed telemetry upload attempts"
+    ignore_errors: true
+    register: check_telemetry_failures
+
+  - name: 'CHECK: Telemetry - Send interval is configured'
+    ansible.builtin.assert:
+      that:
+        - "'Send interval' in telemetry_details_text"
+      fail_msg: "FAIL - Telemetry send interval is NOT configured on {{ inventory_hostname }}"
+      success_msg: "PASS - Telemetry send interval is configured"
+    ignore_errors: true
+    register: check_telemetry_interval
+
+  # ==========================================
+  # Comprehensive Summary Report
+  # ==========================================
+
+  - name: 'Display SLS raw output'
+    ansible.builtin.debug:
+      msg: "{{ sls_text }}"
+
+  - name: 'Display Telemetry settings raw output'
+    ansible.builtin.debug:
+      msg: "{{ telemetry_settings_text }}"
+
+  - name: 'Display Telemetry stats raw output'
+    ansible.builtin.debug:
+      msg: "{{ telemetry_stats_text }}"
+
+  - name: 'Health Check Summary Report'
+    ansible.builtin.debug:
+      msg:
+        - "╔══════════════════════════════════════════════════════╗"
+        - "   SLS & TELEMETRY HEALTH CHECK REPORT"
+        - "   Firewall : {{ inventory_hostname }}"
+        - "   IP       : {{ panorama_host }}"
+        - "╠══════════════════════════════════════════════════════╣"
+        - "  STRATA LOGGING SERVICE (SLS)"
+        - "  ├─ Licensed              : {{ '[PASS]' if not check_sls_licensed.failed else '[FAIL]' }}"
+        - "  ├─ Forwarding Enabled    : {{ '[PASS]' if not check_sls_forwarding.failed else '[FAIL] - Run: set deviceconfig system logging-service-forwarding enabled yes' }}"
+        - "  ├─ Customer Info Fetched : {{ '[PASS]' if not check_sls_customerinfo.failed else '[FAIL]' }}"
+        - "  └─ License Fetch Status  : {{ '[PASS]' if not check_sls_license_fetch.failed else '[FAIL]' }}"
+        - "╠══════════════════════════════════════════════════════╣"
+        - "  DEVICE TELEMETRY"
+        - "  ├─ Certificate Valid       : {{ '[PASS]' if not check_telemetry_cert.failed else '[FAIL]' }}"
+        - "  ├─ Health Performance      : {{ '[PASS]' if not check_telemetry_health.failed else '[FAIL] - Not enabled' }}"
+        - "  ├─ Product Usage           : {{ '[PASS]' if not check_telemetry_usage.failed else '[FAIL] - Not enabled' }}"
+        - "  ├─ Threat Prevention       : {{ '[PASS]' if not check_telemetry_threat.failed else '[FAIL] - Not enabled' }}"
+        - "  ├─ All Stats Successful    : {{ '[PASS]' if not check_telemetry_stats.failed else '[FAIL] - Check stats output above' }}"
+        - "  ├─ No Failed Uploads       : {{ '[PASS]' if not check_telemetry_failures.failed else '[FAIL] - Upload failures detected' }}"
+        - "  └─ Send Interval           : {{ '[PASS]' if not check_telemetry_interval.failed else '[FAIL]' }}"
+        - "╠══════════════════════════════════════════════════════╣"
+        - "  OVERALL : {{ '[ALL CHECKS PASSED]' if not (check_sls_licensed.failed or check_sls_forwarding.failed or check_sls_customerinfo.failed or check_sls_license_fetch.failed or check_telemetry_cert.failed or check_telemetry_health.failed or check_telemetry_usage.failed or check_telemetry_threat.failed or check_telemetry_stats.failed or check_telemetry_failures.failed or check_telemetry_interval.failed) else '[ACTION REQUIRED] - Review FAIL items above' }}"
+        - "╚══════════════════════════════════════════════════════╝"
+

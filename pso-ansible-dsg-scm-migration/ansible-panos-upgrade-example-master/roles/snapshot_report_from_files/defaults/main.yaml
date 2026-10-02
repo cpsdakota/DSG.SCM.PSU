@@ -1,0 +1,4 @@
+---
+reports:
+  - 'arp_table'
+  - 'nics'

@@ -1,0 +1,209 @@
+---
+- name: Push config from SCM to device(s)
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+  vars:
+    # Serials are read from vm_series_devices in inventory.yml.
+    # Override at runtime only if needed:
+    #   -e 'vm_series_devices=["007957000834879","007957000834880"]'
+
+    push_description: "Ansible automated config push"
+
+    # Set wait_for_job=false to fire-and-forget (just get the job_id and exit)
+    wait_for_job: true
+    poll_retries: 40   # max retry attempts
+    poll_delay: 15     # seconds between retries  (40 × 15 = 10 min max)
+
+    scm_base_url: "https://paas-11.prod.panorama.paloaltonetworks.com"
+
+  tasks:
+
+    - name: Authenticate with SCM
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: Validate vm_series_devices is defined
+      ansible.builtin.assert:
+        that:
+          - vm_series_devices is defined
+          - vm_series_devices | length > 0
+        fail_msg: "'vm_series_devices' must be defined in inventory.yml or passed via -e"
+
+    - name: Normalize vm_series_devices into a list
+      ansible.builtin.set_fact:
+        device_list: "{{ [vm_series_devices] if (vm_series_devices is string and not vm_series_devices.startswith('[')) else (vm_series_devices | from_json if vm_series_devices is string else vm_series_devices) }}"
+
+    # ==========================================
+    # Step 1 — Config conflict check (informational)
+    # ==========================================
+
+    - name: Check config conflicts for device(s)
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/api/sase/config/v1/config-conflicts"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+        body_format: json
+        body:
+          devices: "{{ device_list }}"
+        status_code: 200
+        return_content: yes
+      register: conflicts_response
+
+    - name: Display config conflicts result
+      ansible.builtin.debug:
+        msg: "{{ conflicts_response.content }}"
+
+    # ==========================================
+    # Step 2 — Trigger config push
+    # ==========================================
+
+    - name: Trigger config push to device(s)
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/api/sase/config/v1.0/push"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          containers: "{{ device_list }}"
+          description: "{{ push_description }}"
+          override-block: "yes"
+        status_code: 200
+        return_content: yes
+      register: push_response
+
+    - name: Parse push response
+      ansible.builtin.set_fact:
+        push_data: "{{ push_response.content | from_json }}"
+
+    - name: Display push trigger result
+      ansible.builtin.debug:
+        msg:
+          - "Message:  {{ push_data.message }}"
+          - "Job ID:   {{ push_data.job_id }}"
+          - "Success:  {{ push_data.success }}"
+
+    - name: Fail if push was not accepted by SCM
+      ansible.builtin.fail:
+        msg: "Push was not accepted by SCM: {{ push_data }}"
+      when: not (push_data.success | bool)
+
+    # ==========================================
+    # Step 3 — Poll job-groups until completion
+    # ==========================================
+
+    - name: Poll job-groups until push job completes
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/api/sase/config/v1/device-config/job-groups?parentJobId={{ push_data.job_id }}"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: 200
+        return_content: yes
+      register: job_status_response
+      retries: "{{ poll_retries }}"
+      delay: "{{ poll_delay }}"
+      until: >-
+        (job_status_response.content | from_json).data.job_groups[0].jobs_status not in ['PENDING', 'ACT']
+      when: wait_for_job | bool
+
+    - name: Parse completed job group data
+      ansible.builtin.set_fact:
+        job_group: "{{ (job_status_response.content | from_json).data.job_groups[0] }}"
+      when: wait_for_job | bool
+
+    - name: Display job group summary
+      ansible.builtin.debug:
+        msg:
+          - "Job ID:      {{ job_group.parent_job_id }}"
+          - "Type:        {{ job_group.type_str }}"
+          - "Status:      {{ job_group.jobs_status }}"
+          - "Started:     {{ job_group.start_ts }}"
+          - "Ended:       {{ job_group.end_ts }}"
+          - "Description: {{ job_group.parent_description }}"
+      when: wait_for_job | bool
+
+    # ==========================================
+    # Step 4 — Fetch detailed result per job
+    # Parses info messages, warnings, and
+    # summary from each sub-job in the group
+    # ==========================================
+
+    - name: Fetch detailed result for each sub-job
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/api/jobs/v1/{{ item.id }}"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: 200
+        return_content: yes
+      loop: "{{ job_group.jobs }}"
+      loop_control:
+        label: "job {{ item.id }}"
+      register: job_details_responses
+      when: wait_for_job | bool
+
+    - name: Display detailed result per sub-job
+      ansible.builtin.debug:
+        msg: >-
+          {%- set job  = (item.content | from_json).data[0] -%}
+          {%- set det  = job.details | default('{}', true) | from_json -%}
+          {%- set summ = job.summary | default('{}', true) | from_json -%}
+          Job {{ job.id }} ({{ job.type_str }}) on {{ job.dev_serial | default('N/A') }}:
+          Result={{ job.result_str }} | Status={{ job.status_str }} |
+          Start={{ job.start_ts }} | End={{ job.end_ts }} |
+          Info={{ det.info | default([]) | join('; ') }} |
+          Summary={{ summ.info | default([]) | join('; ') }} |
+          Warnings ({{ det.warnings | default([]) | length }}): {{ det.warnings | default([]) | join(' | ') }}
+      loop: "{{ job_details_responses.results }}"
+      loop_control:
+        label: "job {{ item.item.id }}"
+      when: wait_for_job | bool
+
+    # ==========================================
+    # Step 5 — Final pass/fail
+    # PUSHFAIL = device not reachable/ready → warn and exit cleanly
+    # Other failures → hard fail
+    # ==========================================
+
+    - name: Collect any PUSHFAIL sub-jobs (device not reachable)
+      ansible.builtin.set_fact:
+        pushfail_jobs: >-
+          {{ job_details_responses.results
+             | map(attribute='content')
+             | map('from_json')
+             | map(attribute='data')
+             | flatten
+             | selectattr('status_str', 'equalto', 'PUSHFAIL')
+             | list }}
+      when: wait_for_job | bool
+
+    - name: Warn and stop if device was not reachable (PUSHFAIL)
+      when:
+        - wait_for_job | bool
+        - pushfail_jobs | length > 0
+      block:
+        - name: Report device not reachable
+          ansible.builtin.debug:
+            msg:
+              - "Push did not reach the device — status PUSHFAIL."
+              - "Affected serial(s): {{ pushfail_jobs | map(attribute='dev_serial') | list | join(', ') }}"
+              - "The device is likely not connected to SCM yet."
+              - "Verify bootstrap is complete (check_bootstrap_status.yml) then retry."
+        - name: End play — device not reachable
+          ansible.builtin.meta: end_play
+
+    - name: Fail if push job completed with an unexpected error
+      ansible.builtin.fail:
+        msg: "Config push job {{ push_data.job_id }} completed with status '{{ job_group.jobs_status }}'. Check SCM UI for details."
+      when:
+        - wait_for_job | bool
+        - job_group.jobs_status not in ['OK', 'FIN']

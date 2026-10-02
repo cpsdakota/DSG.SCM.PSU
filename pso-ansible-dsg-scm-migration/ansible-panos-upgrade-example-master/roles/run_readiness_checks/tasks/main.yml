@@ -1,0 +1,39 @@
+---
+- name: Debug - print what we're testing
+  ansible.builtin.debug:
+    msg: |
+      Pre-upgrade tests Running against {{ connection_id }} via {{ provider.ip_address }}
+
+- name: Run all Management plane checks
+  paloaltonetworks.panos.panos_readiness_checks:
+    provider: '{{ provider }}'
+    checks: '{{ checks }}'
+  register: check_result
+
+- name: Debug print result
+  ansible.builtin.debug:
+    msg: "{{ check_result }}"
+
+- name: Set the successful and failed checks
+  ansible.builtin.set_fact:
+    panos_upgrade_assurance_passed_readiness_checks: |
+      {{ check_result.response | ansible.builtin.dict2items | selectattr('value.status', 'equalto', 'SUCCESS') }}
+    panos_upgrade_assurance_failed_readiness_checks: |
+      {{ check_result.response | ansible.builtin.dict2items | selectattr('value.status', 'ne', 'SUCCESS') }}
+    panos_upgrade_assurance_skipped_readiness_checks: |
+      {{ check_result.response | ansible.builtin.dict2items | selectattr('value.status', 'equalto', 'SKIPPED') }}
+
+- name: Set the stats
+  ansible.builtin.set_stats:
+    data:
+      total_successful_readiness_checks: |
+        {{ panos_upgrade_assurance_passed_readiness_checks | length }}
+      total_failed_readiness_checks: |
+        {{ panos_upgrade_assurance_failed_readiness_checks | length }}
+
+- name: FAIL - Readiness checks failed
+  ansible.builtin.fail:
+    msg: "Readiness checks failed and exit_on_fail is set to true. Aborting."
+  when:
+    - panos_upgrade_assurance_failed_readiness_checks | length > 0
+    - exit_on_fail

@@ -1,0 +1,196 @@
+---
+# Post-change snapshot and comparison report for firewalls with Advanced Routing enabled.
+#
+# Use this instead of post_snapshot_report.yml when:
+#   - The firewall runs PAN-OS 10.2+ with Advanced Routing Mode enabled
+#   - 'show routing route' returns "Command deprecated in Advanced Routing Mode."
+#
+# What this playbook does:
+#   1. Takes a standard post-change snapshot (arp_table, session_stats, nics)
+#   2. Runs 'show advanced-routing route' separately for routes
+#   3. Patches both snapshots so they are comparable:
+#        - Post-snapshot: injects advanced routing data into the 'routes' key
+#        - Pre-snapshot:  replaces null nics with {} (skips NIC comparison)
+#   4. Generates the comparison report against the pre-snapshot
+#
+# Requires pre_snapshot.yml to have been run first.
+#
+# Usage:
+#   ansible-playbook playbooks/post_snapshot_report_adv_routing.yml \
+#     --vault-password-file .vault_pass
+#
+#   Single device:
+#   ansible-playbook playbooks/post_snapshot_report_adv_routing.yml \
+#     --vault-password-file .vault_pass \
+#     --limit dicks-vmseries-lab2-firewall01
+#
+# Outputs:
+#   snapshots/post_snapshot_<hostname>.json
+#   snapshots/<hostname>_comparison_report.json
+
+- hosts: firewalls
+  connection: local
+  gather_facts: false
+  name: POST (Advanced Routing) - Take snapshot and generate comparison report
+
+  vars:
+    snapshot_directory: "{{ playbook_dir }}/snapshots"
+
+  pre_tasks:
+
+    - name: Set device provider
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+  tasks:
+
+    # ==========================================
+    # Take standard post-change snapshot
+    # (routes excluded — handled separately below)
+    # ==========================================
+
+    - name: 'Take post-change snapshot (arp_table, session_stats, nics)'
+      paloaltonetworks.panos.panos_state_snapshot:
+        provider: '{{ provider }}'
+        state_areas:
+          - 'arp_table'
+          - 'session_stats'
+          - 'nics'
+      register: post_snapshot_raw
+
+    - name: 'Write initial post-snapshot to file'
+      ansible.builtin.copy:
+        content: "{{ post_snapshot_raw }}"
+        dest: "{{ snapshot_directory }}/post_snapshot_{{ connection_id }}.json"
+        mode: '0644'
+
+    # ==========================================
+    # Get routes via Advanced Routing command
+    # ==========================================
+
+    - name: 'Run show advanced-routing route'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: '<show><advanced-routing><route></route></advanced-routing></show>'
+        cmd_is_xml: true
+      register: adv_routing_output
+      ignore_errors: true
+
+    - name: 'Display advanced routing output'
+      ansible.builtin.debug:
+        msg: "Advanced routing command status: {{ 'SUCCESS' if not adv_routing_output.failed else 'FAILED - ' + adv_routing_output.msg | default('unknown') }}"
+
+    # ==========================================
+    # Patch snapshot files (Python)
+    # ==========================================
+
+    - name: 'Write advanced routing output to temp file'
+      ansible.builtin.copy:
+        content: "{{ adv_routing_output.stdout | default('{}') }}"
+        dest: "/tmp/adv_routing_{{ connection_id }}.json"
+      delegate_to: localhost
+
+    - name: 'Patch post-snapshot with advanced routing data and fix pre-snapshot nics'
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, sys
+
+        # ── Parse advanced routing routes ──────────────────────────────────
+        routes = {}
+        try:
+            with open('/tmp/adv_routing_{{ connection_id }}.json') as f:
+                raw = f.read().strip()
+            if raw and raw != '{}':
+                adv = json.loads(raw)
+                result = adv.get('response', {}).get('result', {})
+                lr_data = result.get('logical-router', {})
+                # Normalize to list (single router vs list of routers)
+                if isinstance(lr_data, dict):
+                    lr_data = [lr_data]
+                for lr in (lr_data or []):
+                    entries = lr.get('entry', []) or []
+                    if isinstance(entries, dict):
+                        entries = [entries]
+                    for route in entries:
+                        dst = route.get('dst', route.get('destination', ''))
+                        if dst:
+                            routes[dst] = {
+                                'nexthop':   route.get('nhop',      route.get('nexthop', '')),
+                                'flags':     route.get('flags',     ''),
+                                'interface': route.get('interface', ''),
+                                'age':       str(route.get('age',   '')),
+                                'metric':    str(route.get('metric', '')),
+                                'protocol':  route.get('protocol',  ''),
+                            }
+            print(f"Parsed {len(routes)} advanced route(s).", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: could not parse advanced routing output: {e}", file=sys.stderr)
+
+        # ── Patch post-snapshot ────────────────────────────────────────────
+        post_path = '{{ snapshot_directory }}/post_snapshot_{{ connection_id }}.json'
+        with open(post_path) as f:
+            post = json.load(f)
+
+        # Inject advanced routing routes under the 'routes' key
+        post['response']['routes'] = {
+            'state':    True,
+            'status':   'SUCCESS',
+            'reason':   'show advanced-routing route (patched by post_snapshot_report_adv_routing.yml)',
+            'snapshot': routes,
+        }
+        # Skip NIC comparison: set nics snapshot to {} so pre/post match
+        if 'nics' in post['response']:
+            post['response']['nics']['snapshot'] = {}
+
+        with open(post_path, 'w') as f:
+            json.dump(post, f, indent=2)
+        print("Post-snapshot patched.", file=sys.stderr)
+
+        # ── Patch pre-snapshot ─────────────────────────────────────────────
+        pre_path = '{{ snapshot_directory }}/pre_snapshot_{{ connection_id }}.json'
+        with open(pre_path) as f:
+            pre = json.load(f)
+
+        # Fix null nics so the comparison module does not abort
+        if pre['response'].get('nics', {}).get('snapshot') is None:
+            pre['response']['nics'] = {
+                'state':    True,
+                'status':   'SUCCESS',
+                'reason':   'null replaced with empty dict (nics skipped)',
+                'snapshot': {},
+            }
+
+        with open(pre_path, 'w') as f:
+            json.dump(pre, f, indent=2)
+        print("Pre-snapshot patched.", file=sys.stderr)
+
+        print("All patches applied successfully.")
+        PYEOF
+      register: patch_result
+      delegate_to: localhost
+
+    - name: 'Display patch result'
+      ansible.builtin.debug:
+        msg: "{{ patch_result.stdout }}"
+
+  roles:
+
+    # ==========================================
+    # Generate comparison report
+    # Compare: arp_table + routes (no nics)
+    # ==========================================
+
+    - role: snapshot_report_from_files
+      name: REPORTS - Compare pre and post snapshots (Advanced Routing)
+      vars:
+        left_snapshot:       "pre_snapshot_{{ connection_id }}"
+        right_snapshot:      "post_snapshot_{{ connection_id }}"
+        report_output_file:  "{{ snapshot_directory }}/{{ connection_id }}_comparison_report.json"
+        reports:
+          - 'arp_table'
+          - 'routes'

@@ -1,0 +1,26 @@
+---
+- name: Debug - Print what we're doing
+  ansible.builtin.debug:
+    msg: |
+      Configuring Provider based on given parameters
+
+- name: Set Provider - Panorama
+  when:
+    - panorama_ip_address is defined
+  ansible.builtin.set_fact:
+    provider:
+      ip_address: "{{ panorama_ip_address }}"
+      username: "{{ username | default(lookup('env', 'ANSIBLE_NET_USERNAME')) }}"
+      password: "{{ password | default(lookup('env', 'ANSIBLE_NET_PASSWORD')) }}"
+      serial_number: "{{ serialno }}"
+    connection_id: "{{ panorama_ip_address }}_{{ serialno }}"
+
+- name: Set Provider - Firewall
+  when:
+    - firewall_ip_address is defined
+  ansible.builtin.set_fact:
+    provider:
+      ip_address: "{{ firewall_ip_address }}"
+      username: "{{ username | default(lookup('env', 'ANSIBLE_NET_USERNAME')) }}"
+      password: "{{ password | default(lookup('env', 'ANSIBLE_NET_PASSWORD')) }}"
+    connection_id: "{{ firewall_ip_address }}"

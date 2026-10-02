@@ -1,0 +1,9 @@
+[panorama]
+my-panorama
+
+[panorama:vars]
+ansible_connection=local
+ansible_python_interpreter=/path/to/your/python
+panorama_host=YOUR_PANORAMA_IP
+username=YOUR_USERNAME
+password=YOUR_PASSWORD

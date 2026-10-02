@@ -1,0 +1,1145 @@
+---
+# =============================================================================
+# SCM Migration Master Playbook
+# Runs the full Panorama-to-SCM migration workflow in a single execution.
+#
+# Steps:
+#   0.   Auto-detect SCM internal API base URL (RBAC vs DIRECT gateway mode)
+#   1.   List SCM devices BEFORE migration
+#   2.   Backup firewall configurations + collect serial numbers
+#   3.   Pre-migration snapshot
+#   4.   Remove Panorama management (v2 — CLI: template + shared-policy disable)
+#   5.   Set Panorama cloud-service
+#   6.   [DISABLED] Change hostname (prefix SCMMANAGED- to original hostname)
+#   7.   Claim devices to SCM
+#   7b.  Enable Configuration Scope at device level in SCM
+#   7c.  Associate snp-{serial} snippets to claimed devices
+#   8.   Wait 5 minutes for SCM bootstrap
+#   9.   Post-migration snapshot + comparison report (retry after 3 min if needed)
+#   10.  Post-migration snapshot retry (if needed)
+#   11.  List SCM devices AFTER migration + generate CSV and HTML reports
+#
+# Required variables (vault-encrypted):
+#   group_vars/all/scm_credentials.yml : scm_client_id, scm_client_secret, scm_tsg_id
+#   group_vars/firewalls/credentials.yml: username, password
+#
+# Required per-host inventory vars:
+#   panorama_host — IP address of the firewall
+#
+# Usage:
+#   All firewalls:
+#     ansible-playbook playbook_latest/scm_migration_snippet.yml \
+#       --vault-password-file .vault_pass
+#
+#   Single firewall:
+#     ansible-playbook playbook_latest/scm_migration_snippet.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01
+# =============================================================================
+
+
+# =============================================================================
+# STEP 0 — Detect SCM internal API base URL
+# Probes the public SCM API gateway to determine gateway mode:
+#   RBAC   → base URL: https://api.sase.paloaltonetworks.com
+#   DIRECT → base URL: https://paas-{N}.prod.panorama.paloaltonetworks.com
+# Sets scm_sase_base_url on localhost for use by all subsequent plays.
+# =============================================================================
+- name: "STEP 0 — Detect SCM internal API base URL"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    scm_public_base_url: "https://api.sase.paloaltonetworks.com"
+    scm_probe_endpoint: "/config/ui/api/config/v9.2/Objects/Regions"
+
+  tasks:
+
+    - name: "DETECT — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "DETECT — Decode JWT payload"
+      ansible.builtin.set_fact:
+        jwt_payload: "{{ (scm_access_token.split('.')[1] + '==') | b64decode | from_json }}"
+
+    - name: "DETECT — Extract TSG ID from token"
+      ansible.builtin.set_fact:
+        scm_tsg_id_detected: "{{ jwt_payload.tsg_id | default('') }}"
+
+    - name: "DETECT — Display token info"
+      ansible.builtin.debug:
+        msg:
+          - "TSG ID    : {{ scm_tsg_id_detected }}"
+          - "Token exp : {{ jwt_payload.exp | default('N/A') }}"
+
+    - name: "DETECT — Probe RBAC gateway endpoint"
+      ansible.builtin.uri:
+        url: "{{ scm_public_base_url }}{{ scm_probe_endpoint }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ scm_access_token }}"
+          Accept: "application/json"
+        body_format: json
+        status_code: "{{ range(100, 600) | list }}"
+        return_content: yes
+      register: probe_response
+      ignore_errors: yes
+
+    - name: "DETECT — Determine gateway mode"
+      ansible.builtin.set_fact:
+        scm_gateway_mode: "{{ 'RBAC' if (probe_response.status | default(0)) == 200 else 'DIRECT' }}"
+
+    - name: "DETECT — Display probe result"
+      ansible.builtin.debug:
+        msg:
+          - "Probe status : {{ probe_response.status | default('N/A') }}"
+          - "Gateway mode : {{ scm_gateway_mode }}"
+
+    - name: "DETECT — RBAC mode: set base URL to public API"
+      ansible.builtin.set_fact:
+        scm_sase_base_url: "{{ scm_public_base_url }}"
+      when: scm_gateway_mode == 'RBAC'
+
+    - name: "DETECT — DIRECT mode: probe candidate paas servers"
+      ansible.builtin.uri:
+        url: "https://paas-{{ item }}.prod.panorama.paloaltonetworks.com/sase/config/v1/snippets"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: "{{ range(100, 600) | list }}"
+        return_content: yes
+        timeout: 10
+      register: paas_probe_results
+      ignore_errors: yes
+      loop: "{{ range(1, 31) | list }}"
+      when: scm_gateway_mode == 'DIRECT'
+
+    - name: "DETECT — DIRECT mode: find responding paas server"
+      ansible.builtin.set_fact:
+        scm_sase_base_url: "https://paas-{{ item.item }}.prod.panorama.paloaltonetworks.com"
+      loop: "{{ paas_probe_results.results | default([]) }}"
+      when:
+        - scm_gateway_mode == 'DIRECT'
+        - item.status | default(0) == 200
+        - scm_sase_base_url is not defined or scm_sase_base_url | length == 0
+
+    - name: "DETECT — Fail if base URL could not be resolved"
+      ansible.builtin.fail:
+        msg: "Could not detect SCM base URL. Check credentials and network connectivity."
+      when: scm_sase_base_url is not defined or scm_sase_base_url | length == 0
+
+    - name: "DETECT — Display detected base URL"
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "  Gateway mode     : {{ scm_gateway_mode }}"
+          - "  TSG ID           : {{ scm_tsg_id_detected }}"
+          - "  Detected base URL: {{ scm_sase_base_url }}"
+          - "================================================"
+
+
+# =============================================================================
+# STEP 1 — List SCM devices BEFORE migration
+# =============================================================================
+- name: "STEP 1 — List SCM devices before migration"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  tasks:
+
+    - name: "SCM AUTH — Obtain SCM token"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "SCM LIST — Query registered devices"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/ngfw/api/v1/devices"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        status_code: [200, 201]
+        return_content: true
+      register: scm_before_response
+      ignore_errors: true
+
+    - name: "SCM LIST — Save pre-migration device list"
+      ansible.builtin.set_fact:
+        scm_devices_before: "{{ scm_before_response.json | default([]) }}"
+
+    - name: "SCM LIST — Display devices before migration"
+      ansible.builtin.debug:
+        msg: "Serial: {{ item.id }} | Hostname: {{ item.hostname | default('N/A') }} | Connected: {{ item.is_connected | default('N/A') }} | SW: {{ item.software_version | default('N/A') }}"
+      loop: "{{ scm_devices_before }}"
+      when: scm_devices_before | length > 0
+
+    - name: "SCM LIST — No devices registered yet"
+      ansible.builtin.debug:
+        msg: "No devices currently registered in SCM."
+      when: scm_devices_before | length == 0
+
+
+# =============================================================================
+# STEP 2 — Backup firewall configurations + collect serial numbers
+# =============================================================================
+- name: "STEP 2 — Backup firewall configurations"
+  hosts: firewalls
+  connection: local
+  gather_facts: true
+
+  vars:
+    config_backup_dir: "./firewalls_backups"
+    command_output_dir: "./command_outputs"
+    operational_commands:
+      - "show system info"
+      - "show system disk-space"
+
+  tasks:
+
+    - name: "INIT — Initialize result facts for all steps"
+      ansible.builtin.set_fact:
+        result_backup: "PENDING"
+        result_pre_snapshot: "PENDING"
+        result_remove_panorama: "PENDING"
+        result_cloud_service: "PENDING"
+        result_hostname_change: "PENDING"
+        result_claim: "PENDING"
+        result_post_snapshot: "PENDING"
+        needs_post_retry: false
+        device_serial: "UNKNOWN"
+        device_hostname_original: "UNKNOWN"
+        device_hostname_new: "UNKNOWN"
+
+    - name: "INIT — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - name: "BACKUP — Get system info (serial + hostname)"
+      paloaltonetworks.panos.panos_op:
+        provider: "{{ provider }}"
+        cmd: "show system info"
+      register: system_info_raw
+      ignore_errors: true
+
+    - name: "BACKUP — Extract serial number and hostname"
+      ansible.builtin.set_fact:
+        device_serial: "{{ (system_info_raw.stdout | from_json).response.result.system.serial }}"
+        device_hostname_original: "{{ (system_info_raw.stdout | from_json).response.result.system.hostname }}"
+      when: system_info_raw is succeeded
+
+    - name: "BACKUP — Create backup directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ config_backup_dir }}"
+        - "{{ command_output_dir }}"
+      delegate_to: localhost
+      run_once: true
+
+    - block:
+
+        - name: "BACKUP — Export running configuration"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: '<show><config><running></running></config></show>'
+            cmd_is_xml: true
+          register: running_config_output
+
+        - name: "BACKUP — Save running config as YAML"
+          ansible.builtin.copy:
+            content: |
+              # Running Configuration for {{ inventory_hostname }}
+              # Exported: {{ ansible_date_time.iso8601 | default('N/A') }}
+              # Source: {{ panorama_host }}
+
+              {{ (running_config_output.stdout | from_json).response.result.config | to_nice_yaml(indent=2, width=120) }}
+            dest: "{{ config_backup_dir }}/running-config-{{ inventory_hostname }}.yaml"
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: "BACKUP — Save running config as XML"
+          ansible.builtin.copy:
+            content: "{{ running_config_output.stdout_xml }}"
+            dest: "{{ config_backup_dir }}/running-config-{{ inventory_hostname }}.xml"
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: "BACKUP — Run operational commands"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "{{ item }}"
+          register: command_results
+          loop: "{{ operational_commands }}"
+
+        - name: "BACKUP — Save command outputs"
+          ansible.builtin.copy:
+            content: "{{ command_results.results | map(attribute='stdout_xml') | join('\n\n---\n\n') }}"
+            dest: "{{ command_output_dir }}/command-output-{{ inventory_hostname }}.txt"
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: "BACKUP — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_backup: "SUCCESS"
+
+      rescue:
+
+        - name: "BACKUP — Mark step FAILED"
+          ansible.builtin.set_fact:
+            result_backup: "FAILED"
+
+
+# =============================================================================
+# STEP 3 — Pre-migration snapshot
+# =============================================================================
+- name: "STEP 3 — Pre-migration snapshot"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  tasks:
+
+    - name: "PRE-SNAP — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - block:
+
+        - name: "PRE-SNAP — Take pre-migration snapshot"
+          ansible.builtin.include_role:
+            name: take_snapshot
+          vars:
+            snapshot_filename: "pre_snapshot_{{ connection_id }}"
+
+        - name: "PRE-SNAP — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_pre_snapshot: "SUCCESS"
+
+      rescue:
+
+        - name: "PRE-SNAP — Mark step FAILED"
+          ansible.builtin.set_fact:
+            result_pre_snapshot: "FAILED"
+
+
+# =============================================================================
+# STEP 4 — Remove Panorama management from firewalls (v2 — CLI-based)
+# Uses operational CLI commands instead of xpath config element edits:
+#   set system setting template disable      → stops template push from Panorama
+#   set system setting shared-policy disable → stops policy/objects push from Panorama
+# Both commands take effect immediately; no commit required.
+# =============================================================================
+- name: "STEP 4 — Remove Panorama management"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "RM-PANO — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username | default(omit) }}"
+          password: "{{ password | default(omit) }}"
+          api_key: "{{ api_key | default(omit) }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - block:
+
+        - name: "RM-PANO — Disable Device and Network Template push"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "set system setting template disable"
+            cmd_is_xml: false
+          register: result_template_disable
+          ignore_errors: true
+
+        - name: "RM-PANO — Display template disable result"
+          ansible.builtin.debug:
+            msg:
+              - "Template disable: {{ 'SUCCESS' if result_template_disable is succeeded else 'FAILED' }}"
+              - "Output          : {{ result_template_disable.stdout_xml | default(result_template_disable.msg | default('N/A')) }}"
+
+        - name: "RM-PANO — Disable Panorama shared-policy push"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "set system setting shared-policy disable"
+            cmd_is_xml: false
+          register: result_shared_policy_disable
+          ignore_errors: true
+
+        - name: "RM-PANO — Display shared-policy disable result"
+          ansible.builtin.debug:
+            msg:
+              - "Shared-policy disable: {{ 'SUCCESS' if result_shared_policy_disable is succeeded else 'FAILED' }}"
+              - "Output               : {{ result_shared_policy_disable.stdout_xml | default(result_shared_policy_disable.msg | default('N/A')) }}"
+
+        - name: 'Enable Device and Network Template (set system setting template enable)'
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "set system setting template enable"
+            cmd_is_xml: false
+          register: result_template_enable
+          ignore_errors: true
+
+        - name: "RM-PANO — Display template enable result"
+          ansible.builtin.debug:
+            msg:
+              - "Template enable: {{ 'SUCCESS' if result_template_enable is succeeded else 'FAILED' }}"
+              - "Output         : {{ result_template_enable.stdout_xml | default(result_template_enable.msg | default('N/A')) }}"
+
+        - name: 'Enable Panorama Policy and Objects (set system setting shared-policy enable)'
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "set system setting shared-policy enable"
+            cmd_is_xml: false
+          register: result_shared_policy_enable
+          ignore_errors: true
+
+        - name: "RM-PANO — Display shared-policy enable result"
+          ansible.builtin.debug:
+            msg:
+              - "Shared-policy enable: {{ 'SUCCESS' if result_shared_policy_enable is succeeded else 'FAILED' }}"
+              - "Output              : {{ result_shared_policy_enable.stdout_xml | default(result_shared_policy_enable.msg | default('N/A')) }}"
+
+        - name: "RM-PANO — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_remove_panorama: "SUCCESS"
+
+        - name: "RM-PANO — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_remove_panorama: "SUCCESS"
+
+      rescue:
+
+        - name: "RM-PANO — Mark step FAILED"
+          ansible.builtin.set_fact:
+            result_remove_panorama: "FAILED"
+
+
+# =============================================================================
+# STEP 5 — Set Panorama cloud-service
+# =============================================================================
+- name: "STEP 5 — Set Panorama cloud-service"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "CLOUD-SVC — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - block:
+
+        - name: "CLOUD-SVC — Set Panorama cloud-service element"
+          paloaltonetworks.panos.panos_config_element:
+            provider: "{{ provider }}"
+            xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/panorama"
+            element: '<cloud-service/>'
+
+        - name: "CLOUD-SVC — Commit configuration"
+          paloaltonetworks.panos.panos_commit_firewall:
+            provider: "{{ provider }}"
+            description: "Set Panorama cloud-service via Ansible"
+
+        - name: "CLOUD-SVC — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_cloud_service: "SUCCESS"
+
+      rescue:
+
+        - name: "CLOUD-SVC — Mark step FAILED"
+          ansible.builtin.set_fact:
+            result_cloud_service: "FAILED"
+
+
+# =============================================================================
+# STEP 6 — Change hostname (prefix SCMMANAGED- to original hostname) [DISABLED]
+# =============================================================================
+# - name: "STEP 6 — Change hostname (add SCMMANAGED prefix)"
+#   hosts: firewalls
+#   connection: local
+#   gather_facts: false
+#
+#   tasks:
+#
+#     - name: "HOSTNAME — Set device provider"
+#       ansible.builtin.set_fact:
+#         provider:
+#           ip_address: "{{ panorama_host }}"
+#           username: "{{ username }}"
+#           password: "{{ password }}"
+#         connection_id: "{{ inventory_hostname }}"
+#       no_log: true
+#
+#     - block:
+#
+#         - name: "HOSTNAME — Get current hostname from device"
+#           paloaltonetworks.panos.panos_op:
+#             provider: "{{ provider }}"
+#             cmd: "show system info"
+#           register: hostname_info
+#
+#         - name: "HOSTNAME — Build new hostname with SCMMANAGED prefix"
+#           ansible.builtin.set_fact:
+#             device_hostname_original: "{{ (hostname_info.stdout | from_json).response.result.system.hostname }}"
+#             device_hostname_new: "SCMMANAGED-{{ (hostname_info.stdout | from_json).response.result.system.hostname }}"
+#
+#         - name: "HOSTNAME — Display hostname change"
+#           ansible.builtin.debug:
+#             msg: "Changing hostname: {{ device_hostname_original }} -> {{ device_hostname_new }}"
+#
+#         - name: "HOSTNAME — Set new hostname via config element"
+#           paloaltonetworks.panos.panos_config_element:
+#             provider: "{{ provider }}"
+#             xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system"
+#             element: "<hostname>{{ device_hostname_new }}</hostname>"
+#
+#         - name: "HOSTNAME — Commit configuration"
+#           paloaltonetworks.panos.panos_commit_firewall:
+#             provider: "{{ provider }}"
+#             description: "Rename hostname to {{ device_hostname_new }}"
+#
+#         - name: "HOSTNAME — Mark step SUCCESS"
+#           ansible.builtin.set_fact:
+#             result_hostname_change: "SUCCESS"
+#
+#       rescue:
+#
+#         - name: "HOSTNAME — Mark step FAILED"
+#           ansible.builtin.set_fact:
+#             result_hostname_change: "FAILED"
+
+
+# =============================================================================
+# STEP 7 — Claim devices to SCM
+# Collects serial numbers from all firewall hostvars gathered in Step 2.
+# =============================================================================
+- name: "STEP 7 — Claim devices to SCM"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  tasks:
+
+    - name: "CLAIM — Collect serial numbers from migration hosts"
+      ansible.builtin.set_fact:
+        migration_serials: >-
+          {{ groups['firewalls']
+             | map('extract', hostvars, 'device_serial')
+             | reject('equalto', 'UNKNOWN')
+             | list }}
+
+    - name: "CLAIM — Display devices to be claimed"
+      ansible.builtin.debug:
+        msg:
+          - "=== Claiming devices to SCM ==="
+          - "Serial numbers: {{ migration_serials }}"
+
+    - name: "CLAIM — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - block:
+
+        - name: "CLAIM — Claim devices to SCM"
+          ansible.builtin.uri:
+            url: "https://admin.prod.panorama.paloaltonetworks.com/api/v2/device-registrations/claim"
+            method: POST
+            headers:
+              x-auth-jwt: "{{ scm_access_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              devices: "{{ migration_serials }}"
+              labels: []
+            status_code: [200, 201]
+            return_content: true
+          register: claim_response
+          when: migration_serials | length > 0
+
+        - name: "CLAIM — Display claim results"
+          ansible.builtin.debug:
+            var: claim_response.json
+          when: claim_response is not skipped
+
+        - name: "CLAIM — Mark claim SUCCESS"
+          ansible.builtin.set_fact:
+            claim_result_localhost: "SUCCESS"
+
+      rescue:
+
+        - name: "CLAIM — Mark claim FAILED"
+          ansible.builtin.set_fact:
+            claim_result_localhost: "FAILED"
+
+# --- Internal: propagate claim result to firewall hosts for final report ---
+- name: "STEP 7 (internal) — Propagate claim result to firewall hosts"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "CLAIM — Set claim result on each firewall host"
+      ansible.builtin.set_fact:
+        result_claim: "{{ hostvars['localhost'].claim_result_localhost | default('SKIPPED') }}"
+
+
+# =============================================================================
+# STEP 7b — Enable Configuration Scope at device level in SCM
+# For each claimed device, checks the SASE folder tree to determine whether
+# Configuration Scope is already enabled (device_only == false/absent).
+# If disabled (device_only == true), POSTs to device-config/device-containers
+# to switch the device from monitoring-only to configuration-managed mode.
+# Idempotent — safe to re-run. No commit required.
+# =============================================================================
+- name: "STEP 7b — Enable Configuration Scope at device level"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  tasks:
+
+    - name: "CONFIG-SCOPE — Collect serial numbers from migration hosts"
+      ansible.builtin.set_fact:
+        migration_serials: >-
+          {{ groups['firewalls']
+             | map('extract', hostvars, 'device_serial')
+             | reject('equalto', 'UNKNOWN')
+             | list }}
+
+    - name: "CONFIG-SCOPE — Display devices to process"
+      ansible.builtin.debug:
+        msg:
+          - "=== Enabling Configuration Scope for claimed devices ==="
+          - "Base URL       : {{ scm_sase_base_url }}"
+          - "Serial numbers : {{ migration_serials }}"
+
+    - name: "CONFIG-SCOPE — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "CONFIG-SCOPE — Fetch SASE folder tree"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/folders?pagination=false"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: [200, 201]
+        return_content: true
+      register: folders_response
+
+    - name: "CONFIG-SCOPE — Enable Configuration Scope per device"
+      vars:
+        folder_device_entry: >-
+          {%- set l0 = folders_response.json.data -%}
+          {%- set l1 = l0 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l2 = l1 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l3 = l2 | map(attribute='children', default=[]) | flatten -%}
+          {{ (l0 + l1 + l2 + l3) | selectattr('serial_number', 'defined') | selectattr('serial_number', 'equalto', item) | list | first | default({}) }}
+        config_scope_disabled: "{{ folder_device_entry.device_only | default(false) | bool }}"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/api/sase/config/v1/device-config/device-containers"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ item }}"
+        status_code: [200, 201, 400]
+        return_content: true
+      register: config_scope_results
+      when: config_scope_disabled
+      loop: "{{ migration_serials }}"
+      ignore_errors: true
+
+    - name: "CONFIG-SCOPE — Display results per device"
+      ansible.builtin.debug:
+        msg: >-
+          Device {{ item.item }}:
+          {{ 'SKIPPED (Config Scope already enabled)' if item is skipped
+             else ('ENABLED (HTTP ' + (item.status | string) + ')')
+             if item.status | default(0) in [200, 201]
+             else ('ALREADY EXISTS — already enabled' if (item.json._errors | default([]) | selectattr('code', 'equalto', 'API_I00013') | list | length > 0)
+             else 'FAILED (HTTP ' + (item.status | default('?') | string) + ')') }}
+      loop: "{{ config_scope_results.results | default([]) }}"
+
+
+# =============================================================================
+# STEP 7c — Associate snp-{serial} snippets to claimed devices
+# Derives snippet name as "snp-{serial}" for each migrated device,
+# resolves the snippet UUID from the SCM snippets list, then calls
+# PUT /sase/config/v1/snippets/{uuid}?device={serial} to associate.
+# =============================================================================
+- name: "STEP 7c — Associate snippets to claimed devices"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  tasks:
+
+    - name: "SNIPPET — Collect serial numbers from migration hosts"
+      ansible.builtin.set_fact:
+        migration_serials: >-
+          {{ groups['firewalls']
+             | map('extract', hostvars, 'device_serial')
+             | reject('equalto', 'UNKNOWN')
+             | list }}
+
+    - name: "SNIPPET — Display devices to associate"
+      ansible.builtin.debug:
+        msg:
+          - "=== Associating snp-{serial} snippets to devices ==="
+          - "Base URL       : {{ scm_sase_base_url }}"
+          - "Serial numbers : {{ migration_serials }}"
+
+    - name: "SNIPPET — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "SNIPPET — Fetch snippets list from SCM"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/snippets"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: 200
+        return_content: yes
+      register: snippets_response
+
+    - name: "SNIPPET — Warn if snippet not found for device"
+      vars:
+        current_uuid: "{{ snippets_response.json.data
+          | selectattr('name', 'defined')
+          | selectattr('name', 'equalto', 'snp-' + item)
+          | map(attribute='id')
+          | first
+          | default('') }}"
+      ansible.builtin.debug:
+        msg: "WARNING: Snippet 'snp-{{ item }}' not found in SCM — skipping association."
+      when: current_uuid | length == 0
+      loop: "{{ migration_serials }}"
+
+    - name: "SNIPPET — Associate snp-{serial} snippet to each device"
+      vars:
+        current_uuid: "{{ snippets_response.json.data
+          | selectattr('name', 'defined')
+          | selectattr('name', 'equalto', 'snp-' + item)
+          | map(attribute='id')
+          | first
+          | default('') }}"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/snippets/{{ current_uuid }}?device={{ item }}"
+        method: PUT
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+        body: ""
+        status_code: 200
+        return_content: yes
+      when: current_uuid | length > 0
+      loop: "{{ migration_serials }}"
+      register: snippet_assoc_results
+      ignore_errors: yes
+
+    - name: "SNIPPET — Display association results"
+      ansible.builtin.debug:
+        msg: >-
+          Device {{ item.item }}:
+          {{ 'SKIPPED (snippet not found)' if item is skipped
+             else ('SUCCESS' if item.status | default(0) == 200
+             else 'FAILED (HTTP ' + (item.status | default('?') | string) + ')') }}
+      loop: "{{ snippet_assoc_results.results | default([]) }}"
+
+
+# =============================================================================
+# STEP 8 — Wait 5 minutes for SCM bootstrap
+# =============================================================================
+- name: "STEP 8 — Wait for SCM bootstrap"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "BOOTSTRAP — Wait 5 minutes for SCM bootstrap to complete"
+      ansible.builtin.pause:
+        minutes: 5
+        prompt: "Waiting 5 minutes for SCM bootstrap to complete..."
+
+
+# =============================================================================
+# STEP 9 — Post-migration snapshot + report (first attempt)
+# =============================================================================
+- name: "STEP 9 — Post-migration snapshot (attempt 1)"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+  ignore_unreachable: true
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  tasks:
+
+    - name: "POST-SNAP — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - block:
+
+        - name: "POST-SNAP — Take post-migration snapshot"
+          ansible.builtin.include_role:
+            name: take_snapshot
+          vars:
+            snapshot_filename: "post_snapshot_{{ connection_id }}"
+
+        - name: "POST-SNAP — Compare pre and post snapshots"
+          ansible.builtin.include_role:
+            name: snapshot_report_from_files
+          vars:
+            left_snapshot: "pre_snapshot_{{ connection_id }}"
+            right_snapshot: "post_snapshot_{{ connection_id }}"
+            report_output_file: "{{ connection_id }}_comparison_report.json"
+
+        - name: "POST-SNAP — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_post_snapshot: "SUCCESS"
+            needs_post_retry: false
+
+      rescue:
+
+        - name: "POST-SNAP — Mark as needing retry"
+          ansible.builtin.set_fact:
+            result_post_snapshot: "PENDING_RETRY"
+            needs_post_retry: true
+
+
+# =============================================================================
+# STEP 10 — Post-migration snapshot retry (3 min wait for unreachable hosts)
+# =============================================================================
+- name: "STEP 10 — Post-migration snapshot retry (if needed)"
+  hosts: firewalls
+  connection: local
+  gather_facts: false
+  ignore_unreachable: true
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  tasks:
+
+    - name: "RETRY — Skip host if no retry needed"
+      ansible.builtin.meta: end_host
+      when: not (hostvars[inventory_hostname].needs_post_retry | default(false))
+
+    - name: "RETRY — Wait 3 minutes before retrying"
+      ansible.builtin.pause:
+        minutes: 3
+        prompt: "Host {{ inventory_hostname }} needs retry. Waiting 3 minutes..."
+
+    - name: "RETRY — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+    - block:
+
+        - name: "RETRY — Take post-migration snapshot"
+          ansible.builtin.include_role:
+            name: take_snapshot
+          vars:
+            snapshot_filename: "post_snapshot_{{ connection_id }}"
+
+        - name: "RETRY — Compare pre and post snapshots"
+          ansible.builtin.include_role:
+            name: snapshot_report_from_files
+          vars:
+            left_snapshot: "pre_snapshot_{{ connection_id }}"
+            right_snapshot: "post_snapshot_{{ connection_id }}"
+            report_output_file: "{{ connection_id }}_comparison_report.json"
+
+        - name: "RETRY — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_post_snapshot: "SUCCESS"
+            needs_post_retry: false
+
+      rescue:
+
+        - name: "RETRY — Mark step FAILED (retry also failed)"
+          ansible.builtin.set_fact:
+            result_post_snapshot: "FAILED"
+            needs_post_retry: false
+
+
+# =============================================================================
+# STEP 11 — List SCM devices AFTER migration + generate CSV and HTML reports
+# =============================================================================
+- name: "STEP 11 — List SCM devices after migration and generate reports"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    report_dir: "./overall_reports"
+
+  tasks:
+
+    - name: "AFTER — Set report timestamp"
+      ansible.builtin.set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+    - name: "AFTER — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "AFTER — Query registered devices"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/ngfw/api/v1/devices"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        status_code: [200, 201]
+        return_content: true
+      register: scm_after_response
+      ignore_errors: true
+
+    - name: "AFTER — Save post-migration device list"
+      ansible.builtin.set_fact:
+        scm_devices_after: "{{ scm_after_response.json | default([]) }}"
+
+    - name: "AFTER — Display SCM devices after migration"
+      ansible.builtin.debug:
+        msg: "Serial: {{ item.id }} | Hostname: {{ item.hostname | default('N/A') }} | Connected: {{ item.is_connected | default('N/A') }} | SW: {{ item.software_version | default('N/A') }}"
+      loop: "{{ scm_devices_after }}"
+      when: scm_devices_after | length > 0
+
+    # -------------------------------------------------------------------------
+    # Build migration results list from hostvars
+    # -------------------------------------------------------------------------
+    - name: "REPORT — Collect migration results from all firewall hosts"
+      ansible.builtin.set_fact:
+        migration_results: >-
+          {{ migration_results | default([]) + [{
+            'host':               item,
+            'ip':                 hostvars[item].panorama_host       | default('N/A'),
+            'serial':             hostvars[item].device_serial        | default('UNKNOWN'),
+            'hostname_original':  hostvars[item].device_hostname_original | default('UNKNOWN'),
+            'hostname_new':       hostvars[item].device_hostname_new  | default('UNKNOWN'),
+            'backup':             hostvars[item].result_backup         | default('NOT RUN'),
+            'pre_snapshot':       hostvars[item].result_pre_snapshot   | default('NOT RUN'),
+            'remove_panorama':    hostvars[item].result_remove_panorama| default('NOT RUN'),
+            'cloud_service':      hostvars[item].result_cloud_service  | default('NOT RUN'),
+            'hostname_change':    hostvars[item].result_hostname_change | default('NOT RUN'),
+            'claim':              hostvars[item].result_claim          | default('NOT RUN'),
+            'post_snapshot':      hostvars[item].result_post_snapshot  | default('NOT RUN')
+          }] }}
+      loop: "{{ groups['firewalls'] }}"
+
+    # -------------------------------------------------------------------------
+    # Create output directory
+    # -------------------------------------------------------------------------
+    - name: "REPORT — Create overall_reports directory"
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    # -------------------------------------------------------------------------
+    # CSV report
+    # -------------------------------------------------------------------------
+    - name: "REPORT — Generate CSV report"
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/migration_report_{{ report_timestamp }}.csv"
+        mode: '0644'
+        content: |
+          Device,IP Address,Serial,Original Hostname,New Hostname,Backup,Pre-Snapshot,Remove Panorama,Cloud Service,Hostname Change,Claim to SCM,Post-Snapshot
+          {% for r in migration_results %}
+          {{ r.host }},{{ r.ip }},{{ r.serial }},{{ r.hostname_original }},{{ r.hostname_new }},{{ r.backup }},{{ r.pre_snapshot }},{{ r.remove_panorama }},{{ r.cloud_service }},{{ r.hostname_change }},{{ r.claim }},{{ r.post_snapshot }}
+          {% endfor %}
+
+    # -------------------------------------------------------------------------
+    # HTML report
+    # -------------------------------------------------------------------------
+    - name: "REPORT — Generate HTML report"
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/migration_report_{{ report_timestamp }}.html"
+        mode: '0644'
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>SCM Migration Report</title>
+            <style>
+              body { font-family: Arial, sans-serif; margin: 30px; background: #f4f6f8; color: #333; }
+              h1 { color: #2c3e50; border-bottom: 3px solid #2c3e50; padding-bottom: 8px; }
+              h2 { color: #34495e; margin-top: 40px; }
+              p.meta { color: #666; font-size: 13px; }
+              table { border-collapse: collapse; width: 100%; background: #fff;
+                      box-shadow: 0 2px 6px rgba(0,0,0,0.1); margin-bottom: 30px; }
+              th { background: #2c3e50; color: #fff; padding: 10px 14px;
+                   text-align: left; font-size: 13px; white-space: nowrap; }
+              td { padding: 9px 14px; border-bottom: 1px solid #e0e0e0; font-size: 13px; }
+              tr:last-child td { border-bottom: none; }
+              tr:hover td { background: #f0f4f8; }
+              .badge { display: inline-block; border-radius: 4px; padding: 3px 9px;
+                       font-size: 12px; font-weight: bold; white-space: nowrap; }
+              .SUCCESS       { background: #d4edda; color: #155724; }
+              .FAILED        { background: #f8d7da; color: #721c24; }
+              .PENDING_RETRY { background: #fff3cd; color: #856404; }
+              .PENDING       { background: #fff3cd; color: #856404; }
+              .NOT_RUN       { background: #e2e3e5; color: #383d41; }
+              .SKIPPED       { background: #e2e3e5; color: #383d41; }
+              .UNKNOWN       { background: #e2e3e5; color: #383d41; }
+            </style>
+          </head>
+          <body>
+
+            <h1>SCM Migration Report</h1>
+            <p class="meta">Generated: {{ report_timestamp }} &nbsp;|&nbsp; Devices processed: {{ migration_results | length }}</p>
+
+            <h2>Migration Steps Summary</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Device</th>
+                  <th>IP Address</th>
+                  <th>Serial</th>
+                  <th>Original Hostname</th>
+                  <th>New Hostname</th>
+                  <th>Backup</th>
+                  <th>Pre-Snapshot</th>
+                  <th>Remove Panorama</th>
+                  <th>Cloud Service</th>
+                  <th>Hostname Change</th>
+                  <th>Claim to SCM</th>
+                  <th>Post-Snapshot</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for r in migration_results %}
+                <tr>
+                  <td><strong>{{ r.host }}</strong></td>
+                  <td>{{ r.ip }}</td>
+                  <td>{{ r.serial }}</td>
+                  <td>{{ r.hostname_original }}</td>
+                  <td>{{ r.hostname_new }}</td>
+                  <td><span class="badge {{ r.backup | replace(' ', '_') | replace('-', '_') }}">{{ r.backup }}</span></td>
+                  <td><span class="badge {{ r.pre_snapshot | replace(' ', '_') | replace('-', '_') }}">{{ r.pre_snapshot }}</span></td>
+                  <td><span class="badge {{ r.remove_panorama | replace(' ', '_') | replace('-', '_') }}">{{ r.remove_panorama }}</span></td>
+                  <td><span class="badge {{ r.cloud_service | replace(' ', '_') | replace('-', '_') }}">{{ r.cloud_service }}</span></td>
+                  <td><span class="badge {{ r.hostname_change | replace(' ', '_') | replace('-', '_') }}">{{ r.hostname_change }}</span></td>
+                  <td><span class="badge {{ r.claim | replace(' ', '_') | replace('-', '_') }}">{{ r.claim }}</span></td>
+                  <td><span class="badge {{ r.post_snapshot | replace(' ', '_') | replace('-', '_') }}">{{ r.post_snapshot }}</span></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+
+            <h2>SCM Devices — Before Migration</h2>
+            {% if scm_devices_before | default([]) | length > 0 %}
+            <table>
+              <thead>
+                <tr><th>Serial</th><th>Hostname</th><th>Model</th><th>Connected</th><th>Software Version</th></tr>
+              </thead>
+              <tbody>
+                {% for d in scm_devices_before | default([]) %}
+                <tr>
+                  <td>{{ d.id | default('N/A') }}</td>
+                  <td>{{ d.hostname | default('N/A') }}</td>
+                  <td>{{ d.model | default('N/A') }}</td>
+                  <td>{{ d.is_connected | default('N/A') }}</td>
+                  <td>{{ d.software_version | default('N/A') }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+            <p><em>No devices were registered in SCM before migration.</em></p>
+            {% endif %}
+
+            <h2>SCM Devices — After Migration</h2>
+            {% if scm_devices_after | default([]) | length > 0 %}
+            <table>
+              <thead>
+                <tr><th>Serial</th><th>Hostname</th><th>Model</th><th>Connected</th><th>Software Version</th></tr>
+              </thead>
+              <tbody>
+                {% for d in scm_devices_after | default([]) %}
+                <tr>
+                  <td>{{ d.id | default('N/A') }}</td>
+                  <td>{{ d.hostname | default('N/A') }}</td>
+                  <td>{{ d.model | default('N/A') }}</td>
+                  <td>{{ d.is_connected | default('N/A') }}</td>
+                  <td>{{ d.software_version | default('N/A') }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+            <p><em>No devices found in SCM after migration.</em></p>
+            {% endif %}
+
+          </body>
+          </html>
+
+    # -------------------------------------------------------------------------
+    # Final summary
+    # -------------------------------------------------------------------------
+    - name: "REPORT — Display report file locations"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "  SCM Migration Complete"
+          - "=========================================="
+          - "  CSV  : {{ report_dir }}/migration_report_{{ report_timestamp }}.csv"
+          - "  HTML : {{ report_dir }}/migration_report_{{ report_timestamp }}.html"
+          - "=========================================="

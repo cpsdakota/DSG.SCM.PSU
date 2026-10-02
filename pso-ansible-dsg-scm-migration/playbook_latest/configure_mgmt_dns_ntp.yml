@@ -1,0 +1,251 @@
+---
+# =============================================================================
+# Configure Management Interface, DNS and NTP on NGFW — CLI-based
+#
+# Uses PAN-OS operational CLI commands via panos_op (no xpath config elements):
+#
+#   Management Interface:
+#     set system ip-address <ip>
+#     set system netmask <mask>
+#     set system default-gateway <gw>
+#
+#   DNS:
+#     set system dns-setting servers primary <ip>
+#     set system dns-setting servers secondary <ip>
+#
+#   NTP:
+#     set system ntp-servers primary-ntp-server ntp-server-address <server>
+#     set system ntp-servers secondary-ntp-server ntp-server-address <server>
+#
+# A commit is required — unlike pure operational commands (e.g. set system
+# setting template disable), management interface, DNS and NTP are candidate
+# config changes that must be committed to take effect and persist.
+#
+# WARNING: If changing the management interface IP, Ansible will lose
+# connectivity to the device after the commit since it connects via that IP.
+# Management IP is configured last and the commit is marked ignore_errors
+# so the playbook does not fail on the expected connection drop.
+#
+# Usage:
+#   All firewalls (DNS + NTP only):
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass
+#
+#   Single firewall with all settings:
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01 \
+#       -e 'mgmt_ip=10.0.1.5 mgmt_netmask=255.255.255.0 mgmt_gateway=10.0.1.1'
+#
+#   Specific list via variable:
+#     ansible-playbook playbook_latest/configure_mgmt_dns_ntp.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'firewall_list=["dicks-vmseries-lab22-firewall01"]'
+#
+# Variables (all optional — skip sections by leaving defaults or undefined):
+#   mgmt_ip          — new management IP address  (skip mgmt block if not set)
+#   mgmt_netmask     — management subnet mask      (skip mgmt block if not set)
+#   mgmt_gateway     — management default gateway  (skip mgmt block if not set)
+#   dns_primary      — primary DNS server          (default: 8.8.8.8)
+#   dns_secondary    — secondary DNS server        (default: 8.8.4.4)
+#   ntp_primary      — primary NTP server          (default: pool.ntp.org)
+#   ntp_secondary    — secondary NTP server        (default: time.google.com)
+# =============================================================================
+
+- hosts: firewalls
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    dns_primary:   "10.220.150.50"
+    dns_secondary: "10.211.36.50"
+    ntp_primary:   "tick.dcsg.com"
+    ntp_secondary: "tock.dcsg.com"
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: 'Set target firewall provider information'
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+      no_log: true
+
+    - name: 'Display operation target'
+      ansible.builtin.debug:
+        msg:
+          - "=== Configuring Management Interface, DNS and NTP ==="
+          - "Firewall      : {{ inventory_hostname }}"
+          - "IP Address    : {{ panorama_host }}"
+          - "--- Management Interface ---"
+          - "New IP        : {{ mgmt_ip        | default('(no change)') }}"
+          - "Netmask       : {{ mgmt_netmask   | default('(no change)') }}"
+          - "Gateway       : {{ mgmt_gateway   | default('(no change)') }}"
+          - "--- DNS ---"
+          - "Primary       : {{ dns_primary }}"
+          - "Secondary     : {{ dns_secondary }}"
+          - "--- NTP ---"
+          - "Primary       : {{ ntp_primary }}"
+          - "Secondary     : {{ ntp_secondary }}"
+
+    # ==========================================
+    # Configure DNS
+    # ==========================================
+
+    - name: 'Configure primary DNS server'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system dns-setting servers primary {{ dns_primary }}'
+        cmd_is_xml: false
+      register: result_dns_primary
+      ignore_errors: true
+
+    - name: 'Display primary DNS result'
+      ansible.builtin.debug:
+        msg:
+          - "DNS primary status : {{ 'SUCCESS' if result_dns_primary is succeeded else 'FAILED' }}"
+          - "Output             : {{ result_dns_primary.stdout_xml | default(result_dns_primary.msg | default('N/A')) }}"
+
+    - name: 'Configure secondary DNS server'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system dns-setting servers secondary {{ dns_secondary }}'
+        cmd_is_xml: false
+      register: result_dns_secondary
+      ignore_errors: true
+
+    - name: 'Display secondary DNS result'
+      ansible.builtin.debug:
+        msg:
+          - "DNS secondary status : {{ 'SUCCESS' if result_dns_secondary is succeeded else 'FAILED' }}"
+          - "Output               : {{ result_dns_secondary.stdout_xml | default(result_dns_secondary.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Configure NTP
+    # ==========================================
+
+    - name: 'Configure primary NTP server'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system ntp-servers primary-ntp-server ntp-server-address {{ ntp_primary }}'
+        cmd_is_xml: false
+      register: result_ntp_primary
+      ignore_errors: true
+
+    - name: 'Display primary NTP result'
+      ansible.builtin.debug:
+        msg:
+          - "NTP primary status : {{ 'SUCCESS' if result_ntp_primary is succeeded else 'FAILED' }}"
+          - "Output             : {{ result_ntp_primary.stdout_xml | default(result_ntp_primary.msg | default('N/A')) }}"
+
+    - name: 'Configure secondary NTP server'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system ntp-servers secondary-ntp-server ntp-server-address {{ ntp_secondary }}'
+        cmd_is_xml: false
+      register: result_ntp_secondary
+      ignore_errors: true
+
+    - name: 'Display secondary NTP result'
+      ansible.builtin.debug:
+        msg:
+          - "NTP secondary status : {{ 'SUCCESS' if result_ntp_secondary is succeeded else 'FAILED' }}"
+          - "Output               : {{ result_ntp_secondary.stdout_xml | default(result_ntp_secondary.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Configure Management Interface
+    # Only runs when mgmt_ip, mgmt_netmask and
+    # mgmt_gateway are all provided via -e.
+    # Runs LAST — the commit that follows will
+    # drop connectivity to the current IP.
+    # ==========================================
+
+    - name: 'Configure management interface IP address'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system ip-address {{ mgmt_ip }}'
+        cmd_is_xml: false
+      register: result_mgmt_ip
+      ignore_errors: true
+      when:
+        - mgmt_ip is defined
+        - mgmt_netmask is defined
+        - mgmt_gateway is defined
+
+    - name: 'Configure management interface netmask'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system netmask {{ mgmt_netmask }}'
+        cmd_is_xml: false
+      register: result_mgmt_netmask
+      ignore_errors: true
+      when:
+        - mgmt_ip is defined
+        - mgmt_netmask is defined
+        - mgmt_gateway is defined
+
+    - name: 'Configure management default gateway'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system default-gateway {{ mgmt_gateway }}'
+        cmd_is_xml: false
+      register: result_mgmt_gateway
+      ignore_errors: true
+      when:
+        - mgmt_ip is defined
+        - mgmt_netmask is defined
+        - mgmt_gateway is defined
+
+    - name: 'Display management interface results'
+      ansible.builtin.debug:
+        msg:
+          - "Mgmt IP      : {{ 'SUCCESS' if result_mgmt_ip is succeeded else 'FAILED' }}"
+          - "Mgmt netmask : {{ 'SUCCESS' if result_mgmt_netmask is succeeded else 'FAILED' }}"
+          - "Mgmt gateway : {{ 'SUCCESS' if result_mgmt_gateway is succeeded else 'FAILED' }}"
+          - "NOTE: Connectivity to {{ panorama_host }} will be lost after commit if IP changed."
+      when:
+        - mgmt_ip is defined
+        - mgmt_netmask is defined
+        - mgmt_gateway is defined
+
+    # ==========================================
+    # Commit
+    # ignore_errors: true because changing the
+    # management IP will drop the connection
+    # during or after commit — this is expected.
+    # ==========================================
+
+    - name: 'Commit configuration'
+      paloaltonetworks.panos.panos_commit_firewall:
+        provider: '{{ provider }}'
+        description: "Configure management interface, DNS and NTP via Ansible"
+      register: result_commit
+      ignore_errors: true
+
+    # ==========================================
+    # Final Summary
+    # ==========================================
+
+    - name: 'Display completion summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== Configuration Complete for {{ inventory_hostname }} ==="
+          - "DNS primary    : {{ 'SUCCESS' if result_dns_primary is succeeded else 'FAILED' }}"
+          - "DNS secondary  : {{ 'SUCCESS' if result_dns_secondary is succeeded else 'FAILED' }}"
+          - "NTP primary    : {{ 'SUCCESS' if result_ntp_primary is succeeded else 'FAILED' }}"
+          - "NTP secondary  : {{ 'SUCCESS' if result_ntp_secondary is succeeded else 'FAILED' }}"
+          - "Mgmt IP        : {{ 'SUCCESS' if (result_mgmt_ip is succeeded) else ('SKIPPED' if result_mgmt_ip is skipped else 'FAILED') }}"
+          - "Mgmt netmask   : {{ 'SUCCESS' if (result_mgmt_netmask is succeeded) else ('SKIPPED' if result_mgmt_netmask is skipped else 'FAILED') }}"
+          - "Mgmt gateway   : {{ 'SUCCESS' if (result_mgmt_gateway is succeeded) else ('SKIPPED' if result_mgmt_gateway is skipped else 'FAILED') }}"
+          - "Commit         : {{ 'SUCCESS' if result_commit is succeeded else 'FAILED or connection dropped (expected if mgmt IP changed)' }}"

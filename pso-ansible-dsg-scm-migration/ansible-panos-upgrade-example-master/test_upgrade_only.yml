@@ -1,0 +1,15 @@
+---
+- hosts: all
+  connection: local
+  gather_facts: true
+  name: Example snapshot comparison playbook
+
+  vars:
+    version: 11.2.7-h4
+
+  roles:
+    - role: set_provider
+      name: Set the provider for connections
+
+    - role: upgrade
+      name: Run an upgrade

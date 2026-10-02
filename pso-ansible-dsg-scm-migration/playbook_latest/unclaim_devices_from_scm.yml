@@ -1,0 +1,248 @@
+---
+# =============================================================================
+# Unclaim devices from SCM — rollback counterpart of claim_devices.yml.
+#
+# Two-stage release because SCM has two layers of attachment:
+#   Stage A  (mandatory):  Disable Configuration Scope (delete the device
+#                          container). This moves the device from
+#                          "Cloud Managed" → "Monitoring only".
+#                          Endpoint (documented in enable_config_scope.yml):
+#                            DELETE /api/sase/config/v1/device-config/device-containers?name=<serial>
+#
+#   Stage B  (mandatory for full "Available" state):
+#                          Release the device registration entirely. Moves
+#                          the device from "Monitoring only" → "Available".
+#                          Endpoint (confirmed via SCM GUI DevTools capture):
+#                            POST https://api.sase.paloaltonetworks.com/config/setup/device-onboarding/v1/device-registrations/release
+#                            Authorization: Bearer <token>   (NOT x-auth-jwt)
+#                            body: ["<serial>", "<serial>", ...]   (raw JSON array)
+#                            200 OK on success
+#
+# Variables:
+#   vm_series_devices  (required) — serials to unclaim; defaults to inventory
+#   scm_sase_base_url  (required) — SCM internal base URL; auto-detected by
+#                                   STEP 0 of scm_migration_final_v2.yml or
+#                                   passed via -e
+#
+# Usage:
+#   With auto-detected base URL (run STEP 0 first or pass -e):
+#     ansible-playbook playbook_latest/unclaim_devices_from_scm.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'scm_sase_base_url=https://paas-17.prod.panorama.paloaltonetworks.com'
+#
+#   Specific serials:
+#     ansible-playbook playbook_latest/unclaim_devices_from_scm.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'scm_sase_base_url=https://paas-17.prod.panorama.paloaltonetworks.com' \
+#       -e 'vm_series_devices=["007957000847916"]'
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Auto-detect SCM internal API base URL (only if not already passed via -e).
+# Same logic as STEP 0 of scm_migration_final_v2.yml — probes paas-1..30 and
+# picks the first shard where HTTP 200 AND total > 0 (i.e., actually has
+# the tenant's data). Makes this playbook self-sufficient so the rollback
+# orchestrator doesn't need -e 'scm_sase_base_url=...' on every run.
+# ---------------------------------------------------------------------------
+- name: "Detect SCM internal API base URL (skipped if scm_sase_base_url already set)"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    scm_public_base_url: "https://api.sase.paloaltonetworks.com"
+    scm_probe_endpoint: "/config/ui/api/config/v9.2/Objects/Regions"
+
+  tasks:
+
+    - name: "DETECT — Skip auto-detection if scm_sase_base_url was passed via -e"
+      ansible.builtin.meta: end_play
+      when: scm_sase_base_url is defined and scm_sase_base_url | length > 0
+
+    - name: "DETECT — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: "DETECT — Probe RBAC gateway endpoint"
+      ansible.builtin.uri:
+        url: "{{ scm_public_base_url }}{{ scm_probe_endpoint }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: "{{ range(100, 600) | list }}"
+        return_content: yes
+      register: probe_response
+      ignore_errors: yes
+
+    - name: "DETECT — Determine gateway mode"
+      ansible.builtin.set_fact:
+        scm_gateway_mode: "{{ 'RBAC' if (probe_response.status | default(0)) == 200 else 'DIRECT' }}"
+
+    - name: "DETECT — RBAC mode: set base URL to public API"
+      ansible.builtin.set_fact:
+        scm_sase_base_url: "{{ scm_public_base_url }}"
+      when: scm_gateway_mode == 'RBAC'
+
+    - name: "DETECT — DIRECT mode: probe candidate paas servers"
+      ansible.builtin.uri:
+        url: "https://paas-{{ item }}.prod.panorama.paloaltonetworks.com/sase/config/v1/snippets"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: "{{ range(100, 600) | list }}"
+        return_content: yes
+        timeout: 10
+      register: paas_probe_results
+      ignore_errors: yes
+      loop: "{{ range(1, 31) | list }}"
+      when: scm_gateway_mode == 'DIRECT'
+
+    - name: "DETECT — DIRECT mode: find paas server that holds tenant data (HTTP 200 AND total > 0)"
+      ansible.builtin.set_fact:
+        scm_sase_base_url: "https://paas-{{ item.item }}.prod.panorama.paloaltonetworks.com"
+      loop: "{{ paas_probe_results.results | default([]) }}"
+      when:
+        - scm_gateway_mode == 'DIRECT'
+        - item.status | default(0) == 200
+        - (item.json.total | default(0) | int) > 0
+        - scm_sase_base_url is not defined or scm_sase_base_url | length == 0
+
+    - name: "DETECT — Fail if base URL could not be resolved"
+      ansible.builtin.fail:
+        msg: "Could not auto-detect SCM base URL. Pass it explicitly via -e 'scm_sase_base_url=...'."
+      when: scm_sase_base_url is not defined or scm_sase_base_url | length == 0
+
+    - name: "DETECT — Display detected base URL"
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "  Gateway mode     : {{ scm_gateway_mode }}"
+          - "  Detected base URL: {{ scm_sase_base_url }}"
+          - "================================================"
+
+
+# ---------------------------------------------------------------------------
+# Main play — Unclaim devices from SCM
+# ---------------------------------------------------------------------------
+- name: "Unclaim devices from SCM"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    # Public SCM API host that exposes the device-onboarding release endpoint
+    # (different from scm_sase_base_url, which is the tenant's paas-N shard).
+    scm_public_api_url: "https://api.sase.paloaltonetworks.com"
+
+  tasks:
+
+    - name: "PREFLIGHT — Validate scm_sase_base_url is defined (set by auto-detect or -e)"
+      ansible.builtin.fail:
+        msg: >-
+          scm_sase_base_url is required. Auto-detection failed and no -e
+          override was provided.
+      when: scm_sase_base_url is not defined or scm_sase_base_url | length == 0
+
+    - name: "PREFLIGHT — Normalize vm_series_devices into a list"
+      ansible.builtin.set_fact:
+        unclaim_list: "{{ [vm_series_devices] if (vm_series_devices is string and not vm_series_devices.startswith('[')) else (vm_series_devices | from_json if vm_series_devices is string else vm_series_devices) }}"
+
+    - name: "PREFLIGHT — Display operation summary"
+      ansible.builtin.debug:
+        msg:
+          - "=== Unclaim devices from SCM ==="
+          - "SCM tenant base URL : {{ scm_sase_base_url }}"
+          - "SCM public API URL  : {{ scm_public_api_url }}"
+          - "Serials             : {{ unclaim_list }}"
+
+    - name: "AUTH — Authenticate with SCM"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    # ==========================================
+    # Stage A — Disable Configuration Scope per device
+    # (move device from Cloud-Managed → Monitoring-only)
+    # ==========================================
+
+    - name: "UNCLAIM-A — Disable Configuration Scope for each device"
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/api/sase/config/v1/device-config/device-containers?name={{ item }}"
+        method: DELETE
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: [200, 204, 400, 404]
+        return_content: yes
+      register: disable_scope_results
+      loop: "{{ unclaim_list }}"
+      ignore_errors: yes
+
+    - name: "UNCLAIM-A — Display Configuration Scope disable results"
+      ansible.builtin.debug:
+        msg: >-
+          Device {{ item.item }}:
+          {% if item.status | default(0) in [200, 204] %}SUCCESS — Config Scope disabled
+          {% elif item.status | default(0) == 404 %}NOT PRESENT (already not in Cloud-Managed state)
+          {% else %}FAILED — HTTP {{ item.status | default('?') }} —
+          URL: {{ item.url | default('?') }} | Response: {{ item.content | default(item.msg | default('no body')) }}
+          {% endif %}
+      loop: "{{ disable_scope_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ==========================================
+    # Stage B — Release device registration
+    # (move device from Monitoring-only → Available)
+    #
+    # Endpoint confirmed via SCM GUI DevTools capture:
+    #   POST https://api.sase.paloaltonetworks.com/config/setup/device-onboarding/v1/device-registrations/release
+    #   Authorization: Bearer <scm_access_token>     (NOT the x-auth-jwt header
+    #                                                 used by other SCM endpoints)
+    #   body: ["<serial>", "<serial>", ...]          (raw JSON array, not a dict)
+    #   200 OK on success
+    # ==========================================
+
+    - name: "UNCLAIM-B — Release device registration (POST .../device-registrations/release)"
+      ansible.builtin.uri:
+        url: "{{ scm_public_api_url }}/config/setup/device-onboarding/v1/device-registrations/release"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ scm_access_token }}"
+          Content-Type: "application/json"
+          Accept: "*/*"
+        body_format: json
+        body: "{{ unclaim_list }}"
+        status_code: [200, 204, 400, 404, 405, 409]
+        return_content: yes
+      register: release_response
+      ignore_errors: yes
+
+    - name: "UNCLAIM-B — Display release result"
+      ansible.builtin.debug:
+        msg: >-
+          Release {{ unclaim_list | length }} device(s):
+          {% if release_response.status | default(0) in [200, 204] %}SUCCESS — devices released to Available state
+          | Response: {{ release_response.content | default('(empty body)') }}
+          {% else %}FAILED — HTTP {{ release_response.status | default('?') }} —
+          URL: {{ release_response.url | default('?') }} |
+          Body sent: {{ unclaim_list }} |
+          Response: {{ release_response.content | default(release_response.msg | default('no body')) }}
+          {% endif %}
+
+    # ==========================================
+    # Final summary
+    # ==========================================
+
+    - name: "UNCLAIM — Display completion summary"
+      ansible.builtin.debug:
+        msg:
+          - "=== Unclaim operation complete ==="
+          - "Stage A (Config Scope disable) : see per-device results above"
+          - "Stage B (Release device)        : see per-device results above"
+          - "Verify in SCM UI                : devices should now appear in"
+          - "                                  'Available devices' (or absent)"
+          - "                                  not 'Cloud Managed'."

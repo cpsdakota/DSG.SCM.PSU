@@ -1,0 +1,99 @@
+---
+- name: Move SCM on-prem device to a target folder
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+  vars:
+    # Pass via -e:
+    #   device_serial  — serial number of the device to move (e.g. "007957000834879")
+    #   target_folder  — exact folder name in SCM  (e.g. "dick_prod")
+    scm_sase_base_url: "https://paas-16.prod.panorama.paloaltonetworks.com"
+
+  tasks:
+
+    - name: Authenticate with SCM
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    - name: Validate required input variables
+      ansible.builtin.assert:
+        that:
+          - device_serial is defined
+          - device_serial | length > 0
+          - target_folder is defined
+          - target_folder | length > 0
+        fail_msg: "Both 'device_serial' and 'target_folder' must be provided via -e"
+
+    # ==========================================
+    # Fetch the SCM folder tree
+    # ==========================================
+
+    - name: Fetch SCM folder tree
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/folders?pagination=false"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        status_code: 200
+        return_content: yes
+      register: folders_response
+
+    # ==========================================
+    # Find the device's folder entry ID
+    # The API requires the device's own entry ID (UUID) in the URL,
+    # not the serial number. We traverse up to 4 levels of the folder
+    # tree to locate the entry whose serial_number matches.
+    # ==========================================
+
+    - name: Find device entry in SCM folder tree
+      ansible.builtin.set_fact:
+        device_folder_id: >-
+          {%- set l0 = folders_response.json.data -%}
+          {%- set l1 = l0 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l2 = l1 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l3 = l2 | map(attribute='children', default=[]) | flatten -%}
+          {%- set all_nodes = l0 + l1 + l2 + l3 -%}
+          {{ all_nodes | selectattr('serial_number', 'defined') | selectattr('serial_number', 'equalto', device_serial) | map(attribute='id') | first | default('') }}
+
+    - name: Fail if device serial not found in SCM folder tree
+      ansible.builtin.fail:
+        msg: >-
+          Serial '{{ device_serial }}' was not found in the SCM folder tree.
+          Verify the device has been claimed and is visible in SCM.
+      when: device_folder_id | length == 0
+
+    # ==========================================
+    # Display plan and execute move
+    # ==========================================
+
+    - name: Show move operation details
+      ansible.builtin.debug:
+        msg:
+          - "Serial number:   {{ device_serial }}"
+          - "Folder entry ID: {{ device_folder_id }}"
+          - "Moving to:       {{ target_folder }}"
+
+    - name: Move device to target folder
+      ansible.builtin.uri:
+        url: "{{ scm_sase_base_url }}/sase/config/v1/folders/{{ device_folder_id }}/move"
+        method: PUT
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          target_parent: "{{ target_folder }}"
+        status_code: 200
+        return_content: yes
+      register: move_response
+
+    - name: Display move result
+      ansible.builtin.debug:
+        msg:
+          - "Move successful!"
+          - "Name:            {{ move_response.json.name }}"
+          - "Serial:          {{ move_response.json.serial_number }}"
+          - "Model:           {{ move_response.json.model | default('N/A') }}"
+          - "Moved to folder: {{ target_folder }}"

@@ -1,0 +1,201 @@
+---
+# Take a POST-change network snapshot and generate an HTML comparison report.
+# Run this AFTER making changes to the firewall.
+# Requires pre_snapshot_network.yml to have been run first.
+#
+# Usage:
+#   All firewalls:
+#     ansible-playbook playbooks/post_snapshot_network_report.yml \
+#       --vault-password-file .vault_pass
+#
+#   Specific firewall:
+#     ansible-playbook playbooks/post_snapshot_network_report.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'firewall_list=["dicks-vmseries-lab-firewall02"]'
+#
+# Variables:
+#   firewall_list  (optional) - list of specific firewalls to target
+#
+# Output:
+#   ./snapshots/post_network_<hostname>.json
+#   ./reports/network_comparison_<hostname>_<timestamp>.html
+
+- hosts: firewalls
+  connection: local
+  gather_facts: false
+  name: POST - Take network snapshot and generate HTML comparison report
+
+  vars:
+    snapshot_directory: "{{ playbook_dir }}/../snapshots"
+    reports_directory:  "{{ playbook_dir }}/../reports"
+    run_timestamp:      "{{ now(fmt='%Y%m%d_%H%M%S') }}"
+    python_interpreter: "{{ ansible_python_interpreter | default('python3') }}"
+    report_script:      "{{ playbook_dir }}/../scripts/generate_network_comparison.py"
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: 'Set target firewall provider information'
+      ansible.builtin.set_fact:
+        target_device:
+          provider:
+            ip_address: "{{ panorama_host }}"
+            username: '{{ username | default(omit) }}'
+            password: '{{ password | default(omit) }}'
+            api_key: '{{ api_key | default(omit) }}'
+      no_log: true
+
+    - name: 'Display post-snapshot target'
+      ansible.builtin.debug:
+        msg:
+          - "=== POST-Snapshot: Network State ==="
+          - "Firewall : {{ inventory_hostname }}"
+          - "IP       : {{ panorama_host }}"
+          - "Collecting : ARP Table | Interface Status | Static Routes"
+
+    - name: 'Verify pre-snapshot file exists'
+      ansible.builtin.stat:
+        path: "{{ snapshot_directory }}/pre_network_{{ inventory_hostname }}.json"
+      register: pre_snapshot_stat
+      delegate_to: localhost
+
+    - name: 'Fail if pre-snapshot is missing'
+      ansible.builtin.fail:
+        msg: >
+          Pre-snapshot not found: {{ snapshot_directory }}/pre_network_{{ inventory_hostname }}.json
+          Run pre_snapshot_network.yml first.
+      when: not pre_snapshot_stat.stat.exists
+
+    - name: 'Create snapshots and reports directories'
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ snapshot_directory }}"
+        - "{{ reports_directory }}"
+      delegate_to: localhost
+
+    # ==========================================
+    # Detect Routing Mode
+    # ==========================================
+
+    - name: 'Detect Advanced Routing Engine (ARE)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ target_device.provider }}'
+        cmd: 'show advanced-routing route'
+      register: are_detection
+      ignore_errors: true
+
+    - name: 'Set ARE flag'
+      ansible.builtin.set_fact:
+        are_enabled: "{{ not are_detection.failed }}"
+
+    - name: 'Display detected routing mode'
+      ansible.builtin.debug:
+        msg: "Routing mode: {{ 'Advanced Routing Engine (ARE)' if are_enabled else 'Legacy Routing' }}"
+
+    # ==========================================
+    # Collect Post-Change Network State
+    # ==========================================
+
+    - name: 'Collect ARP table'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ target_device.provider }}'
+        cmd: '<show><arp><entry name="all"/></arp></show>'
+        cmd_is_xml: true
+      register: arp_result
+      ignore_errors: true
+
+    - name: 'Collect interface status'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ target_device.provider }}'
+        cmd: 'show interface all'
+      register: interfaces_result
+      ignore_errors: true
+
+    - name: 'Collect static routes (Legacy Routing)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ target_device.provider }}'
+        cmd: 'show routing route type static'
+      register: routes_result_legacy
+      when: not are_enabled
+      ignore_errors: true
+
+    - name: 'Collect static routes (Advanced Routing Engine)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ target_device.provider }}'
+        cmd: 'show advanced-routing route type static'
+      register: routes_result_are
+      when: are_enabled
+      ignore_errors: true
+
+    - name: 'Set routes_result from whichever task ran'
+      ansible.builtin.set_fact:
+        routes_result: "{{ routes_result_are if are_enabled else routes_result_legacy }}"
+
+    # ==========================================
+    # Save Post Snapshot
+    # ==========================================
+
+    - name: 'Save post-snapshot to JSON file'
+      ansible.builtin.copy:
+        content: "{{ snapshot_data | to_nice_json }}"
+        dest: "{{ snapshot_directory }}/post_network_{{ inventory_hostname }}.json"
+        mode: '0644'
+      vars:
+        snapshot_data:
+          device:         "{{ inventory_hostname }}"
+          ip:             "{{ panorama_host }}"
+          timestamp:      "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
+          arp_xml:        "{{ arp_result.stdout_xml | default('') }}"
+          interfaces_xml: "{{ interfaces_result.stdout_xml | default('') }}"
+          routes_xml:     "{{ routes_result.stdout_xml | default('') }}"
+      delegate_to: localhost
+
+    # ==========================================
+    # Generate HTML Comparison Report
+    # ==========================================
+
+    - name: 'Set report output path'
+      ansible.builtin.set_fact:
+        report_output_path: "{{ reports_directory }}/network_comparison_{{ inventory_hostname }}_{{ run_timestamp }}.html"
+
+    - name: 'Generate HTML comparison report'
+      ansible.builtin.command:
+        cmd: >-
+          {{ python_interpreter }}
+          {{ report_script }}
+          --pre  {{ snapshot_directory }}/pre_network_{{ inventory_hostname }}.json
+          --post {{ snapshot_directory }}/post_network_{{ inventory_hostname }}.json
+          --output {{ report_output_path }}
+      delegate_to: localhost
+      register: report_result
+
+    - name: 'Display report generation output'
+      ansible.builtin.debug:
+        msg: "{{ report_result.stdout }}"
+      when: report_result.stdout | length > 0
+
+    # ==========================================
+    # Final Summary
+    # ==========================================
+
+    - name: 'Display completion summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== Post-Snapshot & Report Complete ==="
+          - "Firewall    : {{ inventory_hostname }}"
+          - "ARP Table   : {{ 'OK - collected' if arp_result is succeeded else 'FAILED - empty snapshot' }}"
+          - "Interfaces  : {{ 'OK - collected' if interfaces_result is succeeded else 'FAILED - empty snapshot' }}"
+          - "Static Routes: {{ 'OK - collected' if routes_result is succeeded else 'FAILED - empty snapshot' }}"
+          - "Pre Snapshot : {{ snapshot_directory }}/pre_network_{{ inventory_hostname }}.json"
+          - "Post Snapshot: {{ snapshot_directory }}/post_network_{{ inventory_hostname }}.json"
+          - "HTML Report  : {{ report_output_path }}"

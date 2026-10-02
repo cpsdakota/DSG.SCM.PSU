@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<config version="11.1.0" urldb="paloaltonetworks" detail-version="11.1.6">
+  <devices>
+    <entry name="localhost.localdomain">
+      <vsys>
+        <entry name="vsys1">
+          <address>
+            <entry name="test-02-address">
+              <ip-netmask>199.100.100.20/32</ip-netmask>
+            </entry>
+            <entry name="test-03-address">
+              <ip-netmask>199.100.100.30/32</ip-netmask>
+            </entry>
+          </address>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>

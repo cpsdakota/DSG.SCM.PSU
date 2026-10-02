@@ -1,0 +1,26 @@
+---
+argument_specs:
+  main:
+    short_description: Runs pre-upgrade test suite and takes an operational snapshot.
+    description:
+      - >-
+        Runs the pre-upgrade ('readiness') tests and takes a snapshot of the operational state of the target 
+        firewall.
+    options:
+      provider:
+        type: "dict"
+        required: true
+        description: "The PAN-OS provider, used to connect to the device."
+      snapshot_directory:
+        type: "str"
+        default: "./snapshots"
+        required: false
+        description: "Path to directory in which to store state snapshots"
+      state_areas:
+        type: "list"
+        default:
+          - 'arp_table'
+          - 'session_stats'
+          - 'nics'
+        required: false
+        description: "List of state snapshots to take."

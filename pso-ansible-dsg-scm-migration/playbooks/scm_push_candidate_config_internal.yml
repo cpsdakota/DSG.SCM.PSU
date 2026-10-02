@@ -1,0 +1,131 @@
+---
+# Push SCM candidate config to target folders and/or devices using the SCM internal API.
+#
+# Uses the internal API (same pattern as claim_devices.yml) instead of the public SCM API.
+# Auth header: x-auth-jwt
+# Base URL: https://admin.prod.panorama.paloaltonetworks.com
+#
+# Usage examples:
+#
+#   Push to a folder:
+#     ansible-playbook playbooks/scm_push_candidate_config_internal.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'push_description="Policy update"' \
+#       -e 'push_folders=["dick_prod"]'
+#
+#   Push to specific devices by serial number:
+#     ansible-playbook playbooks/scm_push_candidate_config_internal.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'push_description="Migrating from Panorama to SCM"' \
+#       -e 'push_devices=["007957000815595","007957000815592"]'
+#
+# Variables:
+#   push_folders     (optional) - list of SCM folder names to push to
+#   push_devices     (optional) - list of device serial numbers as strings
+#   push_description (required) - description of the push operation
+
+- name: Push SCM candidate config via SCM internal API
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    scm_internal_base_url: "https://admin.prod.panorama.paloaltonetworks.com"
+    push_folders: []
+    push_devices: []
+    push_description: ""
+
+  tasks:
+
+    # ==========================================
+    # Pre-flight Validation
+    # ==========================================
+
+    - name: 'Validate push_description is provided'
+      ansible.builtin.fail:
+        msg: "push_description is required. Example: -e 'push_description=\"Policy update\"'"
+      when: push_description == ""
+
+    - name: 'Validate at least one target is provided (folder or device)'
+      ansible.builtin.fail:
+        msg: "You must provide at least one target. Use push_folders and/or push_devices."
+      when:
+        - push_folders | length == 0
+        - push_devices | length == 0
+
+    - name: 'Normalize push_folders to list'
+      ansible.builtin.set_fact:
+        push_folders: "{{ push_folders | from_json if push_folders is string else push_folders }}"
+      when: push_folders | length > 0
+
+    - name: 'Normalize push_devices to list'
+      ansible.builtin.set_fact:
+        push_devices: "{{ push_devices | from_json if push_devices is string else push_devices }}"
+      when: push_devices | length > 0
+
+    - name: 'Display push operation summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== SCM Candidate Config Push (Internal API) ==="
+          - "Target Folders : {{ push_folders if push_folders | length > 0 else 'None' }}"
+          - "Target Devices : {{ push_devices if push_devices | length > 0 else 'None' }}"
+          - "Description    : {{ push_description }}"
+
+    # ==========================================
+    # Authenticate with SCM
+    # ==========================================
+
+    - name: Authenticate with SCM
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    # ==========================================
+    # Push Candidate Config
+    # ==========================================
+
+    - name: 'Push candidate config to folders via internal API'
+      ansible.builtin.uri:
+        url: "{{ scm_internal_base_url }}/api/v2/config-versions/candidate:push"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          folders: "{{ push_folders }}"
+          description: "{{ push_description }}"
+        status_code: [200, 201, 202]
+        return_content: true
+      register: push_response
+      when: push_folders | length > 0
+
+    - name: 'Push candidate config to devices via internal API'
+      ansible.builtin.uri:
+        url: "{{ scm_internal_base_url }}/api/v2/config-versions/candidate:push"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          devices: "{{ push_devices }}"
+          description: "{{ push_description }}"
+        status_code: [200, 201, 202]
+        return_content: true
+      register: push_devices_response
+      when: push_devices | length > 0
+
+    # ==========================================
+    # Display Results
+    # ==========================================
+
+    - name: 'Display folder push response'
+      ansible.builtin.debug:
+        var: push_response.json
+      when: push_folders | length > 0
+
+    - name: 'Display device push response'
+      ansible.builtin.debug:
+        var: push_devices_response.json
+      when: push_devices | length > 0

@@ -1,0 +1,56 @@
+---
+# Take a POST-change snapshot and generate a comparison report against the PRE snapshot.
+# Run this playbook AFTER making changes to the device.
+# Requires pre_snapshot.yml to have been run first.
+#
+# Usage:
+#   ansible-playbook playbooks/post_snapshot_report.yml \
+#     --vault-password-file .vault_pass
+#
+# Snapshots are saved to ./snapshots/post_snapshot_<inventory_hostname>.json
+# Report is saved to    ./snapshots/<inventory_hostname>_comparison_report.json
+
+- hosts: firewalls
+  connection: local
+  gather_facts: false
+  name: POST - Take post-change snapshot and generate comparison report
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  pre_tasks:
+
+    ################################
+    # Setup provider for roles     #
+    ################################
+
+    - name: Set device provider
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        connection_id: "{{ inventory_hostname }}"
+      no_log: true
+
+  roles:
+
+    ##################
+    # TAKE SNAPSHOT  #
+    ##################
+
+    - role: take_snapshot
+      name: SNAPSHOTS - Take the post-change snapshot
+      vars:
+        snapshot_filename: "post_snapshot_{{ connection_id }}"
+
+    ###################
+    # GENERATE REPORT #
+    ###################
+
+    - role: snapshot_report_from_files
+      name: REPORTS - Compare pre and post snapshots and generate report
+      vars:
+        left_snapshot: "pre_snapshot_{{ connection_id }}"
+        right_snapshot: "post_snapshot_{{ connection_id }}"
+        report_output_file: "{{ connection_id }}_comparison_report.json"

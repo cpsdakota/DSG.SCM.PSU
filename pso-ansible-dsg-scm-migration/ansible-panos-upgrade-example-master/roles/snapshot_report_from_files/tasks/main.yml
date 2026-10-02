@@ -1,0 +1,43 @@
+---
+- name: Debug - print what we're testing
+  ansible.builtin.debug:
+    msg: |
+      Comparing snapshots for {{ connection_id }}
+
+- name: Set filepaths
+  set_fact:
+    left_full_path: "{{ [snapshot_directory, left_snapshot] | path_join }}.json"
+    right_full_path: "{{ [snapshot_directory, right_snapshot] | path_join }}.json"
+    report_output_file: "{{ report_output_file | default('report.json') }}"
+
+- name: Set Snapshot Data
+  set_fact:
+    left_snapshot: '{{ lookup("file", left_full_path) | from_json }}'
+    right_snapshot: '{{ lookup("file", right_full_path) | from_json }}'
+
+- name: Compare Routes, ARP Table and Network interfaces - ignoring route uptime changes
+  paloaltonetworks.panos.panos_snapshot_report:
+    left_snapshot: '{{ left_snapshot.response }}'
+    right_snapshot: '{{ right_snapshot.response }}'
+    reports: '{{ reports }}'
+  register: report
+  ignore_errors: true
+
+- name: Write the report content to a file
+  ansible.builtin.copy:
+    content: "{{ report }}"
+    dest: "{{ report_output_file }}"
+    mode: '0644' # Quote octal numbers for consistent results
+  when: not report.failed
+
+- name: Write error report to file
+  ansible.builtin.copy:
+    content: "{{ {'status': 'comparison_failed', 'error': report.msg | default('unknown error')} | to_json }}"
+    dest: "{{ report_output_file }}"
+    mode: '0644'
+  when: report.failed
+
+- name: Save the output as stats
+  ansible.builtin.set_stats:
+    data:
+      snapshot_result_data: "{{ report.response | default('comparison_failed') }}"

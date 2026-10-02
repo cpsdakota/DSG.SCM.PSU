@@ -1,0 +1,14 @@
+---
+- hosts: all
+  connection: local
+  gather_facts: true
+  name: Example Policy Lookup Playbook
+
+  vars:
+    exit_on_fail: true
+
+  roles:
+    - role: set_provider
+      name: Set the provider for connections
+
+    - run_readiness_checks

@@ -1,0 +1,37 @@
+---
+- name: Debug - Print what we're doing
+  ansible.builtin.debug:
+    msg: |
+      Running upgrade of {{ connection_id }} !! The system will reboot!!
+
+- name: Get Base image from passed software version
+  set_fact:
+    base_image: "{{ version | regex_replace('(\\d+.\\d+)\\.\\d+\\S*', '\\1.0') }}"
+
+- name: Print base image
+  ansible.builtin.debug:
+    msg: "{{ base_image }}"
+
+- name: Download base image (if needed)
+  paloaltonetworks.panos.panos_software:
+    provider: '{{ provider }}'
+    version: '{{ base_image }}'
+    install: false
+    restart: false
+
+- name: Install target version - !! DEVICE WILL RESTART !!
+  paloaltonetworks.panos.panos_software:
+    provider: '{{ provider }}'
+    version: '{{ version }}'
+    install: true
+    restart: true
+
+# Wait 2 minutes, then check every 5 seconds for 10 minutes.
+- name: Wait for device to restart
+  paloaltonetworks.panos.panos_check:
+    provider: '{{ provider }}'
+    initial_delay: 300
+    interval: 5
+    timeout: 900
+
+

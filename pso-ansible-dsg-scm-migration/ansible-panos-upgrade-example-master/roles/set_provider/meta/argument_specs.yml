@@ -1,0 +1,29 @@
+---
+argument_specs:
+  main:
+    short_description: Runs pre-upgrade test suite and takes an operational snapshot.
+    description:
+      - >-
+        Runs the pre-upgrade ('readiness') tests and takes a snapshot of the operational state of the target 
+        firewall.
+    options:
+      panorama_ip_address:
+        type: "str"
+        required: false
+        description: "The PANORAMA IP address to proxy API calls through. Either this OR firewall_ip_address must be set."
+      firewall_ip_address:
+        type: "str"
+        required: false
+        description: "The firewall IP address. If this is set, calls will not be proxied via panorama."
+      serialno:
+        type: "str"
+        required: false
+        description: "The serial number of the firewall to run checks on"
+      username:
+        type: "str"
+        required: false
+        description: "Firewall login username - defaults to envvar ANSIBLE_NET_USERNAME"
+      password:
+        type: "str"
+        required: false
+        description: "Firewall login password - defaults to ennvar ANSIBLE_NET_PASSWORD"

@@ -1,0 +1,176 @@
+---
+# =============================================================================
+# Enable Configuration Scope for an NGFW device in SCM
+#
+# Uses the internal SCM API endpoint discovered via browser DevTools:
+#
+#   Enable  : POST   /api/sase/config/v1/device-config/device-containers
+#             Body   : {"name": "<serial>"}
+#             Returns: 201 Created
+#
+#   Disable : DELETE /api/sase/config/v1/device-config/device-containers?name=<serial>
+#             Returns: 200 OK
+#
+# Base URL : https://paas-16.prod.panorama.paloaltonetworks.com
+# Auth     : x-auth-jwt
+#
+# The playbook checks the folder tree first (device_only field) and skips
+# the POST if Configuration Scope is already enabled. Idempotent.
+#
+# Usage:
+#   Single device:
+#     ansible-playbook playbook_latest/enable_config_scope.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'device_serial="007957000847916"'
+#
+#   Multiple devices:
+#     ansible-playbook playbook_latest/enable_config_scope.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'device_serial="007957000847916"'
+#     (run once per device or extend with a loop via -e)
+#
+# Variables:
+#   device_serial  (required) — serial number of the target NGFW device
+# =============================================================================
+
+- name: "Enable Configuration Scope for NGFW device in SCM"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  vars:
+    scm_base_url: "https://paas-16.prod.panorama.paloaltonetworks.com"
+    device_serial: ""
+
+  tasks:
+
+    - name: "VALIDATE — Require device_serial"
+      ansible.builtin.assert:
+        that:
+          - device_serial | length > 0
+        fail_msg: "device_serial is required. Example: -e 'device_serial=\"007957000847916\"'"
+
+    - name: "AUTH — Obtain SCM token"
+      ansible.builtin.include_role:
+        name: scm_auth
+
+    # ==========================================
+    # Check current state via folder tree
+    # device_only=true  → Config Scope DISABLED
+    # device_only=false → Config Scope ENABLED
+    # ==========================================
+
+    - name: "INSPECT — Fetch SASE folder tree"
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/sase/config/v1/folders?pagination=false"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: [200, 201]
+        return_content: true
+      register: folders_response
+
+    - name: "INSPECT — Find device entry in folder tree"
+      ansible.builtin.set_fact:
+        folder_device_entry: >-
+          {%- set l0 = folders_response.json.data -%}
+          {%- set l1 = l0 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l2 = l1 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l3 = l2 | map(attribute='children', default=[]) | flatten -%}
+          {{ (l0 + l1 + l2 + l3) | selectattr('serial_number', 'defined') | selectattr('serial_number', 'equalto', device_serial) | list | first | default({}) }}
+
+    - name: "INSPECT — Fail if device not found in folder tree"
+      ansible.builtin.fail:
+        msg: "Device '{{ device_serial }}' not found in the SASE folder tree. Verify it has been claimed."
+      when: folder_device_entry | length == 0
+
+    - name: "INSPECT — Determine if Config Scope needs enabling"
+      ansible.builtin.set_fact:
+        # device_only absent → device container already exists → Config Scope ENABLED → default(false)
+        # device_only: true  → monitoring only → Config Scope DISABLED
+        # device_only: false → Config Scope ENABLED
+        config_scope_disabled: "{{ folder_device_entry.device_only | default(false) | bool }}"
+
+    - name: "INSPECT — Display current state"
+      ansible.builtin.debug:
+        msg:
+          - "Serial       : {{ folder_device_entry.serial_number }}"
+          - "device_only  : {{ folder_device_entry.device_only | default('absent') }}"
+          - "Config Scope : {{ 'ALREADY ENABLED — nothing to do' if not config_scope_disabled else 'DISABLED — enabling now' }}"
+
+    - name: "INSPECT — Skip if Config Scope already enabled"
+      ansible.builtin.meta: end_play
+      when: not config_scope_disabled
+
+    # ==========================================
+    # Enable Configuration Scope
+    # POST creates the device-container entry
+    # which switches the device from monitoring-only
+    # to configuration-managed mode in SCM.
+    # ==========================================
+
+    - name: "ENABLE — POST to device-config/device-containers"
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/api/sase/config/v1/device-config/device-containers"
+        method: POST
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ device_serial }}"
+        status_code: [200, 201, 400]
+        return_content: true
+      register: enable_response
+
+    - name: "ENABLE — Fail if error is not OBJECT_ALREADY_EXISTS"
+      ansible.builtin.fail:
+        msg: "POST failed: {{ enable_response.json | to_nice_json }}"
+      when:
+        - enable_response.status == 400
+        - enable_response.json._errors | default([]) | selectattr('code', 'equalto', 'API_I00013') | list | length == 0
+
+    - name: "ENABLE — Display response"
+      ansible.builtin.debug:
+        msg:
+          - "HTTP status   : {{ enable_response.status }}"
+          - "Result        : {{ 'Created (Config Scope enabled)' if enable_response.status in [200, 201] else 'Device container already existed — Config Scope was already enabled' }}"
+          - "Response body : {{ enable_response.json | default(enable_response.content) | to_nice_json }}"
+
+    # ==========================================
+    # Verify — re-read folder tree to confirm
+    # device_only flipped to false
+    # ==========================================
+
+    - name: "VERIFY — Re-read folder tree"
+      ansible.builtin.uri:
+        url: "{{ scm_base_url }}/sase/config/v1/folders?pagination=false"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Accept: "application/json"
+        status_code: [200, 201]
+        return_content: true
+      register: folders_after
+
+    - name: "VERIFY — Extract updated entry"
+      ansible.builtin.set_fact:
+        entry_after: >-
+          {%- set l0 = folders_after.json.data -%}
+          {%- set l1 = l0 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l2 = l1 | map(attribute='children', default=[]) | flatten -%}
+          {%- set l3 = l2 | map(attribute='children', default=[]) | flatten -%}
+          {{ (l0 + l1 + l2 + l3) | selectattr('serial_number', 'defined') | selectattr('serial_number', 'equalto', device_serial) | list | first | default({}) }}
+
+    - name: "SUMMARY"
+      ansible.builtin.debug:
+        msg:
+          - "==========================================="
+          - "  Enable Configuration Scope — Summary"
+          - "==========================================="
+          - "  Device Serial : {{ device_serial }}"
+          - "  device_only   : {{ entry_after.device_only | default('absent (Config Scope enabled)') }}"
+          - "  Config Scope  : {{ 'ENABLED' if not (entry_after.device_only | default(false) | bool) else 'STILL DISABLED — check response above' }}"
+          - "==========================================="

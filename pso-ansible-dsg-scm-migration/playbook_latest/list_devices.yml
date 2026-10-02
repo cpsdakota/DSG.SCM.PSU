@@ -1,0 +1,33 @@
+---
+- name: List SCM registered devices
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../group_vars/all/scm_credentials.yml
+
+  tasks:
+    - name: Authenticate with SCM
+      include_role:
+        name: scm_auth
+
+    - name: List registered devices
+      uri:
+        url: "https://paas-11.prod.panorama.paloaltonetworks.com/ngfw/api/v1/devices"
+        method: GET
+        headers:
+          x-auth-jwt: "{{ scm_access_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        status_code: [200, 201]
+        return_content: yes
+      register: devices_response
+
+    - name: Display devices
+      debug:
+        msg: "{{ devices_response.json }}"
+
+    - name: Show device summary
+      debug:
+        msg: "Serial: {{ item.id }} | Hostname: {{ item.hostname }} | Model: {{ item.model }} | Connected: {{ item.is_connected }} | SW: {{ item.software_version }} | Uptime: {{ item.uptime }}"
+      loop: "{{ devices_response.json }}"
+      when: devices_response.json is iterable

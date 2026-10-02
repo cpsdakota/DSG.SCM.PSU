@@ -1,0 +1,29 @@
+---
+- hosts: all
+  connection: local
+  gather_facts: true
+  name: Example snapshot comparison playbook
+
+  vars:
+    snapshot_directory: "./snapshots"
+
+  roles:
+    - role: set_provider
+      name: Set the provider for connections
+
+    - role: take_snapshot
+      name: Take the pre-upgrade snapshot
+      vars:
+        snapshot_filename: "pre_upgrade_snapshot_{{ connection_id }}"
+
+    - role: take_snapshot
+      name: Take the post-upgrade snapshot
+      vars:
+        snapshot_filename: "post_upgrade_snapshot_{{ connection_id }}"
+
+    - role: snapshot_report_from_files
+      name: Compare the two snapshot reports and write it to a file
+      vars:
+        left_snapshot: "pre_upgrade_snapshot_{{ connection_id }}"
+        right_snapshot: "post_upgrade_snapshot_{{ connection_id }}"
+        report_output_file: "comparison_report.json"

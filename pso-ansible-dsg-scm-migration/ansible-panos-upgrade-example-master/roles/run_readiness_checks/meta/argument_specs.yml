@@ -1,0 +1,27 @@
+---
+argument_specs:
+  main:
+    short_description: Runs pre-upgrade test suite and takes an operational snapshot.
+    description:
+      - >-
+        Runs the pre-upgrade ('readiness') tests and takes a snapshot of the operational state of the target 
+        firewall.
+    options:
+      provider:
+        type: "dict"
+        required: true
+        description: "The PAN-OS provider, used to connect to the device."
+      exit_on_fail:
+        type: "bool"
+        required: false
+        default: false
+        description: "Playbook fails if any readiness check fails."
+      checks:
+        type: "list"
+        required: false
+        default:
+          - '!ha'
+          - '!session_exist'
+          - '!arp_entry_exist'
+          - '!ip_sec_tunnel_status'
+        description: "The readiness checks to run (or not to run)"

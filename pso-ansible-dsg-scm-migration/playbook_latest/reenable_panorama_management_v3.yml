@@ -1,0 +1,393 @@
+---
+# =============================================================================
+# Re-enable on-prem Panorama management on NGFW (rollback counterpart of
+# remove_panorama_management_v3.yml + set_panorama_cloud_service.yml).  --- v3
+#
+# WHAT'S NEW IN v3 (hardening — fixes two masking bugs seen in the field)
+#   Fix #1 — Template / shared-policy enable no longer swallow errors.
+#     The "set system setting template enable" and "...shared-policy enable"
+#     ops used to run with ignore_errors:true. When the boot-time/commit lock
+#     was still held for a brief window they failed with "A commit is in
+#     progress. Please try again later." — logged but ignored, so the run
+#     finished failed=0 while the settings never actually applied. v3 retries
+#     them (until success, short backoff) and, if still failing, FAILS LOUDLY.
+#
+#   Fix #2 — Job-waits now check the job RESULT, not just ACT/PEND.
+#     The boot-time auto-commit wait (Step 0) and the commit wait (Step 3)
+#     previously reported "CLEAR"/"COMPLETED" as soon as no Commit/AutoCom job
+#     was ACT/PEND — even if that job finished with result=FAIL (e.g. a boot
+#     auto-commit that dies with "can't get router id"). v3 parses the result
+#     of the most-recent finished Commit/AutoCom job and HARD-STOPS the play
+#     with the offending job id if it is not OK.
+#
+# Flow:
+#   1. Remove the <cloud-service/> element from deviceconfig/system/panorama
+#      (stops the firewall from talking to SCM).
+#   2. Set <panorama-server> to the on-prem Panorama IP (resolved from
+#      inventory: hostvars of any host in the 'panorama' group).
+#   3. Commit the configuration.
+#   4. Enable Device & Network Template push from Panorama (CLI: set system
+#      setting template enable).
+#   5. Enable Panorama Policy & Objects push (CLI: set system setting
+#      shared-policy enable).
+#
+# Variables:
+#   panorama_server_ip — override (optional). Default: auto-resolved from
+#                        hostvars[groups['panorama'][0]].panorama_host
+#                        (the panorama host's IP in inventory.yml).
+#   firewall_list      — optional list to target specific hosts
+#
+# Usage:
+#   All firewalls (auto-resolves Panorama IP from inventory):
+#     ansible-playbook playbook_latest/reenable_panorama_management.yml \
+#       --vault-password-file .vault_pass
+#
+#   Single firewall:
+#     ansible-playbook playbook_latest/reenable_panorama_management.yml \
+#       --vault-password-file .vault_pass \
+#       --limit dicks-vmseries-lab22-firewall01
+#
+#   Override Panorama IP:
+#     ansible-playbook playbook_latest/reenable_panorama_management.yml \
+#       --vault-password-file .vault_pass \
+#       -e 'panorama_server_ip=13.72.98.89'
+# =============================================================================
+
+- hosts: firewalls
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    # ---------------------------------------------------------------------
+    # reenable_apply_config — controls Steps 0-3 (remove cloud-service, set
+    # <panorama-server>, commit).
+    #
+    #   true (DEFAULT): RUN them. Real-world device-state .tgz files are
+    #     POST-migration snapshots — they still contain <cloud-service/>,
+    #     advance-routing=yes, and NO operational <panorama-server> under
+    #     panorama/local-panorama (the only panorama-server in them lives in
+    #     <initcfg>, which a running firewall ignores). So import-state does
+    #     NOT restore Panorama connectivity, and these steps are REQUIRED to
+    #     remove cloud-service and set the Panorama IP. Confirmed on the
+    #     client (Store1866fw1-440) and lab bundles, Jul 2026.
+    #
+    #   false: SKIP them. Only safe when you KNOW the device-state .tgz is a
+    #     clean PRE-migration baseline that already carries the operational
+    #     <panorama-server>. Pass -e reenable_apply_config=false.
+    #
+    # Steps 4-5 (CLI template/shared-policy enable) ALWAYS run — they are not
+    # captured by device-state.
+    # ---------------------------------------------------------------------
+    reenable_apply_config: true
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: 'Set target firewall provider'
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+      no_log: true
+
+    - name: 'Resolve PRIMARY Panorama server IP (override > 1st inventory panorama host)'
+      ansible.builtin.set_fact:
+        effective_panorama_server: >-
+          {{ panorama_server_ip
+             | default(hostvars[groups['panorama'][0]].panorama_host)
+             | default('') }}
+
+    # Secondary is OPTIONAL. Schema confirmed from a Panorama-managed capture:
+    #   <panorama><local-panorama>
+    #     <panorama-server>IP1</panorama-server>
+    #     <panorama-server-2>IP2</panorama-server-2>   <-- sibling inside local-panorama
+    #   </local-panorama></panorama>
+    # Resolution order: -e panorama_server_secondary  >  2nd host in the
+    # inventory 'panorama' group (if present)  >  '' (none = single server).
+    - name: 'Resolve SECONDARY Panorama server IP (optional)'
+      ansible.builtin.set_fact:
+        effective_panorama_server_2: >-
+          {{ panorama_server_secondary
+             if (panorama_server_secondary is defined and (panorama_server_secondary | length) > 0)
+             else ((hostvars[groups['panorama'][1]].panorama_host)
+                   if ((groups['panorama'] | default([])) | length > 1)
+                   else '') }}
+
+    - name: 'Fail if no Panorama server IP could be resolved'
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve a Panorama server IP. Define a 'panorama' group with
+          a host in inventory.yml (with panorama_host set), or pass -e
+          'panorama_server_ip=<ip>'.
+      when: effective_panorama_server | length == 0
+
+    - name: 'Display operation target'
+      ansible.builtin.debug:
+        msg:
+          - "=== Re-enabling on-prem Panorama management ==="
+          - "Firewall             : {{ inventory_hostname }}"
+          - "Firewall IP          : {{ panorama_host }}"
+          - "Panorama server (1)  : {{ effective_panorama_server }}"
+          - "Panorama server (2)  : {{ effective_panorama_server_2 if (effective_panorama_server_2 | length > 0) else '(none)' }}"
+
+    # ==========================================
+    # Steps 0-3 — Directly apply Panorama-management config
+    # (wait for auto-commit, remove cloud-service, set panorama-server, commit).
+    #
+    # SKIPPED BY DEFAULT (reenable_apply_config=false) — import-state covers
+    # this in the rollback chain. Force ON with -e reenable_apply_config=true
+    # for standalone use or an uncertain device-state baseline. See the vars
+    # block at the top for the full rationale.
+    # ==========================================
+
+    - name: 'Apply Panorama-management config directly (Steps 0-3)'
+      when: reenable_apply_config | default(false) | bool
+      block:
+
+        # Step 0 — Wait for any boot-time auto-commit to FINISH before editing.
+        # A prior rollback stage (import-state / disable_advanced_routing)
+        # reboots the firewall; while the boot-time auto-commit is ACT/PEND,
+        # PAN-OS rejects config edits AND commits ("auto-commit not yet
+        # finished successfully"). Poll until clear, then proceed.
+        - name: 'Wait for boot-time auto-commit to finish (poll show jobs all, max 15 min)'
+          paloaltonetworks.panos.panos_op:
+            provider: '{{ provider }}'
+            cmd: 'show jobs all'
+            cmd_is_xml: false
+          register: precommit_jobs_check
+          vars:
+            _jobs_raw: "{{ (precommit_jobs_check.stdout | default('{}') | from_json).response.result.job | default([]) }}"
+            _jobs_list: "{{ [_jobs_raw] if (_jobs_raw is mapping) else _jobs_raw }}"
+            active_commit_jobs: >-
+              {{ _jobs_list
+                 | selectattr('type', 'in', ['Commit', 'AutoCom'])
+                 | selectattr('status', 'in', ['ACT', 'PEND'])
+                 | list }}
+          until:
+            - precommit_jobs_check is succeeded
+            - active_commit_jobs | length == 0
+          retries: 30      # 30 × 30s = 15 minutes max
+          delay: 30
+          changed_when: false
+          ignore_errors: true
+
+        - name: 'Display auto-commit wait result'
+          ansible.builtin.debug:
+            msg: "Boot-time auto-commit : {{ 'CLEAR — safe to edit/commit' if precommit_jobs_check is succeeded else 'TIMEOUT — proceeding anyway' }}"
+
+        # Fix #2 — verify the boot-time auto-commit RESULT (not just ACT/PEND).
+        # A boot auto-commit that finishes with result=FAIL (e.g. "can't get
+        # router id") otherwise looks CLEAR and the rollback proceeds onto a
+        # broken config. Inspect the most-recent finished Commit/AutoCom job
+        # from 'show jobs all' and hard-stop if its result is not OK.
+        - name: 'Assert boot-time auto-commit finished OK (hard stop otherwise)'
+          vars:
+            _jobs_raw: "{{ (precommit_jobs_check.stdout | default('{}') | from_json).response.result.job | default([]) }}"
+            _jobs_list: "{{ [_jobs_raw] if (_jobs_raw is mapping) else _jobs_raw }}"
+            _fin_commit_jobs: >-
+              {{ _jobs_list
+                 | selectattr('type', 'in', ['Commit', 'AutoCom'])
+                 | selectattr('status', 'equalto', 'FIN')
+                 | list }}
+            _latest_id: "{{ (_fin_commit_jobs | map(attribute='id') | map('int') | max) if (_fin_commit_jobs | length > 0) else 0 }}"
+            _latest_job: "{{ (_fin_commit_jobs | selectattr('id', 'equalto', _latest_id | string) | first) if (_fin_commit_jobs | length > 0) else {} }}"
+          ansible.builtin.fail:
+            msg: >-
+              Boot-time auto-commit (job {{ _latest_id }}) finished with result
+              '{{ _latest_job.result | default('UNKNOWN') }}' on {{ inventory_hostname }}.
+              Aborting rollback — the firewall config did not commit cleanly
+              (commonly "can't get router id" when the Panorama template merge
+              has not applied). Investigate on the device:
+              > show jobs id {{ _latest_id }}
+          when:
+            - _fin_commit_jobs | length > 0
+            - (_latest_job.result | default('OK')) != 'OK'
+
+        # Step 1 — Remove cloud-service element (stops firewall talking to SCM)
+        - name: 'Remove <cloud-service/> element from deviceconfig/system/panorama'
+          paloaltonetworks.panos.panos_config_element:
+            provider: '{{ provider }}'
+            xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/panorama/cloud-service"
+            state: absent
+          register: result_cloud_service_remove
+          ignore_errors: true
+
+        - name: 'Display cloud-service removal result'
+          ansible.builtin.debug:
+            msg:
+              - "Remove cloud-service : {{ 'SUCCESS' if result_cloud_service_remove is succeeded else 'SKIPPED/FAILED (may not have been set)' }}"
+
+        # Step 2 — Set on-prem Panorama server IP(s) at the CORRECT schema path.
+        # Schema confirmed from a Panorama-managed device-state capture:
+        #   <panorama><local-panorama>
+        #     <panorama-server>IP1</panorama-server>
+        #     <panorama-server-2>IP2</panorama-server-2>   (secondary, optional)
+        #   </local-panorama></panorama>
+        # (NOT .../system/panorama-server — that node doesn't exist in the
+        # schema -> code=13. A plain set here creates local-panorama locally,
+        # same simple approach as set_panorama_cloud_service.yml.)
+        # <panorama-server-2> is emitted only when a secondary was resolved.
+        - name: 'Set <panorama-server>(+2) under panorama/local-panorama (correct schema path)'
+          paloaltonetworks.panos.panos_config_element:
+            provider: '{{ provider }}'
+            xpath: "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/panorama"
+            element: "<local-panorama><panorama-server>{{ effective_panorama_server }}</panorama-server>{% if effective_panorama_server_2 | length > 0 %}<panorama-server-2>{{ effective_panorama_server_2 }}</panorama-server-2>{% endif %}</local-panorama>"
+          register: result_panorama_server
+          ignore_errors: true
+
+        - name: 'Display Panorama server result'
+          ansible.builtin.debug:
+            msg:
+              - "Panorama server set : {{ 'SUCCESS' if result_panorama_server is succeeded else 'FAILED' }}"
+              - "Primary             : {{ effective_panorama_server }}"
+              - "Secondary           : {{ effective_panorama_server_2 if (effective_panorama_server_2 | length > 0) else '(none)' }}"
+              - "Detail              : {{ result_panorama_server.msg | default('(ok)') }}"
+
+        # Step 3 — Commit the changes (ASYNC + explicit job-wait). sync=false
+        # so a mgmt-side change doesn't drop the sync polling connection and
+        # mask the result; then poll 'show jobs all' until commit finishes.
+        - name: 'Queue commit (async, sync=false)'
+          paloaltonetworks.panos.panos_commit_firewall:
+            provider: '{{ provider }}'
+            description: "Re-enable on-prem Panorama management via Ansible"
+            sync: false
+          register: result_commit
+          ignore_errors: true
+
+        - name: 'Display commit queue result'
+          ansible.builtin.debug:
+            msg:
+              - "Commit queued : {{ 'SUCCESS' if result_commit is succeeded else 'FAILED to queue (commit may still be running on firewall — wait loop below verifies)' }}"
+              - "Job ID        : {{ result_commit.jobid | default(result_commit.commit_jobid | default('?')) }}"
+
+        - name: 'Brief pause to let the commit job appear in the queue'
+          ansible.builtin.pause:
+            seconds: 5
+
+        - name: 'Wait for commit job to FINISH on firewall (poll show jobs all, max 10 min)'
+          paloaltonetworks.panos.panos_op:
+            provider: '{{ provider }}'
+            cmd: 'show jobs all'
+            cmd_is_xml: false
+          register: commit_jobs_check
+          vars:
+            _jobs_raw: "{{ (commit_jobs_check.stdout | default('{}') | from_json).response.result.job | default([]) }}"
+            _jobs_list: "{{ [_jobs_raw] if (_jobs_raw is mapping) else _jobs_raw }}"
+            active_commit_jobs: >-
+              {{ _jobs_list
+                 | selectattr('type', 'in', ['Commit', 'AutoCom'])
+                 | selectattr('status', 'in', ['ACT', 'PEND'])
+                 | list }}
+          until:
+            - commit_jobs_check is succeeded
+            - active_commit_jobs | length == 0
+          retries: 20      # 20 × 30s = 10 minutes max
+          delay: 30
+          changed_when: false
+          ignore_errors: true
+
+        - name: 'Display commit result'
+          ansible.builtin.debug:
+            msg: "Commit : {{ 'COMPLETED on firewall' if commit_jobs_check is succeeded else 'TIMEOUT — proceeding anyway' }}"
+
+        # Fix #2 — verify the re-enable commit RESULT (not just ACT/PEND).
+        - name: 'Assert re-enable commit finished OK (hard stop otherwise)'
+          vars:
+            _jobs_raw: "{{ (commit_jobs_check.stdout | default('{}') | from_json).response.result.job | default([]) }}"
+            _jobs_list: "{{ [_jobs_raw] if (_jobs_raw is mapping) else _jobs_raw }}"
+            _fin_commit_jobs: >-
+              {{ _jobs_list
+                 | selectattr('type', 'in', ['Commit', 'AutoCom'])
+                 | selectattr('status', 'equalto', 'FIN')
+                 | list }}
+            _latest_id: "{{ (_fin_commit_jobs | map(attribute='id') | map('int') | max) if (_fin_commit_jobs | length > 0) else 0 }}"
+            _latest_job: "{{ (_fin_commit_jobs | selectattr('id', 'equalto', _latest_id | string) | first) if (_fin_commit_jobs | length > 0) else {} }}"
+          ansible.builtin.fail:
+            msg: >-
+              Re-enable Panorama-management commit (job {{ _latest_id }}) finished with
+              result '{{ _latest_job.result | default('UNKNOWN') }}' on {{ inventory_hostname }}.
+              Aborting rollback — the cloud-service removal / panorama-server change
+              did not commit cleanly. Investigate on the device:
+              > show jobs id {{ _latest_id }}
+          when:
+            - _fin_commit_jobs | length > 0
+            - (_latest_job.result | default('OK')) != 'OK'
+
+    - name: 'Note that config steps were skipped (import-state covers them)'
+      ansible.builtin.debug:
+        msg: "Steps 0-3 (cloud-service/panorama-server/commit) SKIPPED — reenable_apply_config=false (import-state is expected to have restored this config). Pass -e reenable_apply_config=true to force them."
+      when: not (reenable_apply_config | default(false) | bool)
+
+    # ==========================================
+    # Step 4 — Enable template push (CLI op)
+    # ==========================================
+
+    # Fix #1 — retry past the commit-lock window instead of ignoring failures.
+    # The lock ("A commit is in progress. Please try again later.") is usually
+    # released within seconds of the commit/auto-commit job finishing; retrying
+    # a handful of times clears it. ignore_errors is REMOVED so that if the op
+    # genuinely cannot apply after all retries, the play FAILS LOUDLY rather
+    # than reporting a green run with the setting never applied.
+    - name: 'Enable Device and Network Template push (set system setting template enable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting template enable'
+        cmd_is_xml: false
+      register: result_template_enable
+      until: result_template_enable is succeeded
+      retries: 6        # 6 × 10s = ~60s past the commit-lock window (tunable)
+      delay: 10
+
+    - name: 'Display template enable result'
+      ansible.builtin.debug:
+        msg:
+          - "Template enable : {{ 'SUCCESS' if result_template_enable is succeeded else 'FAILED' }}"
+          - "Output          : {{ result_template_enable.stdout_xml | default(result_template_enable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Step 5 — Enable shared-policy push (CLI op)
+    # ==========================================
+
+    # Fix #1 — same retry-past-the-lock treatment as the template enable above.
+    - name: 'Enable Panorama Policy and Objects push (set system setting shared-policy enable)'
+      paloaltonetworks.panos.panos_op:
+        provider: '{{ provider }}'
+        cmd: 'set system setting shared-policy enable'
+        cmd_is_xml: false
+      register: result_shared_policy_enable
+      until: result_shared_policy_enable is succeeded
+      retries: 6        # 6 × 10s = ~60s past the commit-lock window (tunable)
+      delay: 10
+
+    - name: 'Display shared-policy enable result'
+      ansible.builtin.debug:
+        msg:
+          - "Shared-policy enable : {{ 'SUCCESS' if result_shared_policy_enable is succeeded else 'FAILED' }}"
+          - "Output               : {{ result_shared_policy_enable.stdout_xml | default(result_shared_policy_enable.msg | default('N/A')) }}"
+
+    # ==========================================
+    # Final summary
+    # ==========================================
+
+    - name: 'Display completion summary'
+      ansible.builtin.debug:
+        msg:
+          - "=== Panorama Management Re-enabled for {{ inventory_hostname }} ==="
+          - "Config steps (0-3)    : {{ 'APPLIED' if (reenable_apply_config | default(false) | bool) else 'SKIPPED (import-state covers cloud-service/panorama-server/commit)' }}"
+          - "Cloud-service removed : {{ ('SUCCESS' if (result_cloud_service_remove is defined and result_cloud_service_remove is succeeded) else 'FAILED') if (reenable_apply_config | default(false) | bool) else 'n/a (skipped)' }}"
+          - "Panorama server (1)   : {{ effective_panorama_server }}  ({{ ('SUCCESS' if (result_panorama_server is defined and result_panorama_server is succeeded) else 'FAILED') if (reenable_apply_config | default(false) | bool) else 'n/a (skipped)' }})"
+          - "Panorama server (2)   : {{ effective_panorama_server_2 if (effective_panorama_server_2 | length > 0) else '(none)' }}"
+          - "Commit                : {{ ('COMPLETED' if (commit_jobs_check is defined and commit_jobs_check is succeeded) else 'TIMEOUT') if (reenable_apply_config | default(false) | bool) else 'n/a (skipped)' }}"
+          - "Template push         : {{ 'ENABLED' if result_template_enable is succeeded else 'FAILED' }}"
+          - "Shared-policy push    : {{ 'ENABLED' if result_shared_policy_enable is succeeded else 'FAILED' }}"
+          - "Next step             : firewall should now reconnect to Panorama on {{ effective_panorama_server }}."

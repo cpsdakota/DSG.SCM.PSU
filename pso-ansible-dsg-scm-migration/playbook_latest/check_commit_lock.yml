@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# Check and Remove Commit Locks on NGFW (standalone version of STEP 3B
+# from scm_migration_final_v2.yml).
+#
+# Flow per firewall:
+#   1. Run 'show commit-locks vsys all' (panos_op, JSON output).
+#   2. Extract any admin holding a lock (handles single-entry vs multi-entry
+#      XML-to-JSON list/dict quirk; admin name is in <entry name="..."/>).
+#   3. If no locks → end host cleanly.
+#   4. For each admin, run 'request commit-lock remove admin <admin>'.
+#   5. Re-check that locks are cleared; warn if any remain.
+#
+# NOTE on cross-admin removal: PAN-OS's XML API silently rejects a request
+# to remove ANOTHER admin's commit-lock when the calling user is not the
+# lock holder ("Commit lock is not currently held by <calling_user>").
+# This affects both the CLI and XML forms of the panos_op call. For locks
+# held by the calling user, removal works. For locks held by other admins,
+# clear them via the SCM GUI or the device CLI before re-running.
+#
+# Usage:
+#   ansible-playbook playbook_latest/remove_commit_lock.yml \
+#     --vault-password-file .vault_pass \
+#     --limit <firewall>
+#
+#   With CLI credentials:
+#     ansible-playbook playbook_latest/remove_commit_lock.yml \
+#       --limit <firewall> \
+#       -e 'username=panadmin' -e 'password=FW_PW'
+# =============================================================================
+
+- hosts: firewalls
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: 'Check if running for specific firewalls only'
+      ansible.builtin.set_fact:
+        run_for_this_host: "{{ (firewall_list is not defined) or (inventory_hostname in firewall_list) }}"
+
+    - name: 'Skip host if not in firewall_list'
+      ansible.builtin.meta: end_host
+      when: not (run_for_this_host | bool)
+
+    - name: "COMMIT-LOCK — Set device provider"
+      ansible.builtin.set_fact:
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: "{{ username | default(omit) }}"
+          password: "{{ password | default(omit) }}"
+          api_key: "{{ api_key | default(omit) }}"
+      no_log: true
+
+    - name: "COMMIT-LOCK — Display operation target"
+      ansible.builtin.debug:
+        msg:
+          - "=== Check and Remove Commit Locks ==="
+          - "Firewall   : {{ inventory_hostname }}"
+          - "IP Address : {{ panorama_host }}"
+
+    - block:
+
+        # =============================================================
+        # Step 1 — Query current commit-locks
+        # =============================================================
+
+        - name: "COMMIT-LOCK — Check for existing commit locks"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "show commit-locks vsys all"
+            cmd_is_xml: false
+          register: locks_check
+
+        # =============================================================
+        # Step 2 — Extract admin names holding any lock
+        # XML-to-JSON quirk: 'entry' is a dict if there's only one lock
+        # and a list otherwise. Normalize to a list before extracting.
+        # The admin name lives in the @name XML attribute on <entry>.
+        # =============================================================
+
+        - name: "COMMIT-LOCK — Extract admin usernames holding the locks"
+          ansible.builtin.set_fact:
+            locked_admins: >-
+              {%- set rslt = (locks_check.stdout | default('{}') | from_json).response.result | default({}) -%}
+              {%- set lock_node = rslt['commit-locks'] | default({}) -%}
+              {%- set entry = lock_node.entry | default([]) if lock_node is mapping else [] -%}
+              {%- set entry_list = [entry] if entry is mapping else (entry | default([])) -%}
+              {{ entry_list | rejectattr('@name', 'undefined') | map(attribute='@name') | list }}
+
+        - name: "COMMIT-LOCK — Display current lock state"
+          ansible.builtin.debug:
+            msg:
+              - "Firewall          : {{ inventory_hostname }}"
+              - "Commit-locks held : {{ locked_admins | length }}"
+              - "Admins holding    : {{ locked_admins if (locked_admins | length > 0) else 'none' }}"
+
+        # =============================================================
+        # Step 3 — Short-circuit when nothing to do
+        # =============================================================
+
+        - name: "COMMIT-LOCK — Nothing to do (no locks held)"
+          when: locked_admins | length == 0
+          block:
+            - name: "COMMIT-LOCK — Mark step SUCCESS (no locks)"
+              ansible.builtin.set_fact:
+                result_commit_lock: "SUCCESS (no locks)"
+            - name: "COMMIT-LOCK — End host (no work)"
+              ansible.builtin.meta: end_host
+
+        # =============================================================
+        # Step 4 — Remove the lock for every admin holding one
+        # =============================================================
+
+        - name: "COMMIT-LOCK — Remove commit lock for each holding admin"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "request commit-lock remove admin {{ item }}"
+            cmd_is_xml: false
+          loop: "{{ locked_admins }}"
+          loop_control:
+            label: "{{ item }}"
+          register: lock_remove_results
+          ignore_errors: true
+
+        - name: "COMMIT-LOCK — Display removal results per admin"
+          ansible.builtin.debug:
+            msg: >-
+              Admin {{ item.item }}:
+              {{ 'SUCCESS — lock removed' if item is succeeded
+                 else 'FAILED — ' + (item.msg | default('unknown error')) }}
+          loop: "{{ lock_remove_results.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        # =============================================================
+        # Step 5 — Re-check to confirm locks are gone
+        # =============================================================
+
+        - name: "COMMIT-LOCK — Re-check that locks are now cleared"
+          paloaltonetworks.panos.panos_op:
+            provider: "{{ provider }}"
+            cmd: "show commit-locks vsys all"
+            cmd_is_xml: false
+          register: locks_recheck
+
+        - name: "COMMIT-LOCK — Extract remaining locks after removal"
+          ansible.builtin.set_fact:
+            remaining_locks: >-
+              {%- set rslt = (locks_recheck.stdout | default('{}') | from_json).response.result | default({}) -%}
+              {%- set lock_node = rslt['commit-locks'] | default({}) -%}
+              {%- set entry = lock_node.entry | default([]) if lock_node is mapping else [] -%}
+              {%- set entry_list = [entry] if entry is mapping else (entry | default([])) -%}
+              {{ entry_list | rejectattr('@name', 'undefined') | map(attribute='@name') | list }}
+
+        - name: "COMMIT-LOCK — Warn if any locks remain"
+          ansible.builtin.debug:
+            msg:
+              - "WARNING: {{ remaining_locks | length }} commit-lock(s) still present after removal."
+              - "Admins still holding locks: {{ remaining_locks }}"
+              - "PAN-OS API does not allow removal of locks held by other admins."
+              - "Clear remaining locks via the SCM GUI or device CLI."
+          when: remaining_locks | length > 0
+
+        - name: "COMMIT-LOCK — Mark step SUCCESS"
+          ansible.builtin.set_fact:
+            result_commit_lock: "{{ 'SUCCESS' if remaining_locks | length == 0 else 'PARTIAL (some locks remain)' }}"
+
+      rescue:
+
+        - name: "COMMIT-LOCK — Mark step FAILED"
+          ansible.builtin.set_fact:
+            result_commit_lock: "FAILED"
+
+    # ==========================================
+    # Final summary
+    # ==========================================
+
+    - name: "COMMIT-LOCK — Display completion summary"
+      ansible.builtin.debug:
+        msg:
+          - "=== Commit-Lock Cleanup Complete for {{ inventory_hostname }} ==="
+          - "Status : {{ result_commit_lock | default('UNKNOWN') }}"
